@@ -10,7 +10,13 @@
 # the project for the full license.                                 #
 #                                                                   #
 #####################################################################
-from __future__ import print_function
+from __future__ import division, unicode_literals, print_function, absolute_import
+from labscript_utils import PY2
+if PY2:
+    str = unicode
+    import Queue as queue
+else:
+    import queue
 
 import os
 import sys
@@ -21,7 +27,6 @@ import time
 import contextlib
 import subprocess
 import threading
-import Queue
 import socket
 import ast
 import pprint
@@ -70,6 +75,25 @@ os.chdir(runmanager_dir)
 zprocess.locking.set_client_process_name('runmanager')
 
 
+def log_if_global(g, g_list, message):
+    """logs a message if the global name "g" is in "g_list"
+    
+    useful if you want to print out a message inside a loop over globals,
+    but only for a particular global (or set of globals).
+    
+    If g_list is empty, then it will use the hardcoded list below
+    (useful if you want to change the behaviour globally)    
+    """
+    if not isinstance(g_list, list):
+        g_list = [g_list]
+        
+    if not g_list:
+        g_list = [] # add global options here
+    
+    if g in g_list:
+        logger.info(message)
+
+    
 def set_win_appusermodel(window_id):
     from labscript_utils.winshell import set_appusermodel, appids, app_descriptions
     icon_path = os.path.abspath('runmanager.ico')
@@ -1144,7 +1168,7 @@ class GroupTab(object):
                 if isinstance(value, Exception):
                     value_item.setBackground(QtGui.QBrush(QtGui.QColor(self.COLOR_ERROR)))
                     value_item.setIcon(QtGui.QIcon(':qtutils/fugue/exclamation'))
-                    tooltip = '%s: %s' % (value.__class__.__name__, value.message)
+                    tooltip = '%s: %s' % (value.__class__.__name__, str(value))
                     tab_contains_errors = True
                 else:
                     if value_item.background().color().name().lower() != self.COLOR_OK.lower():
@@ -1222,6 +1246,7 @@ class RunManager(object):
     AXES_COL_NAME = 0
     AXES_COL_LENGTH = 1
     AXES_COL_SHUFFLE = 2
+    AXES_ROLE_NAME = QtCore.Qt.UserRole + 1
 
     # Constants for the model in the groups tab:
     GROUPS_COL_NAME = 0
@@ -1235,7 +1260,7 @@ class RunManager(object):
     GROUPS_DUMMY_ROW_TEXT = '<Click to add group>'
 
     def __init__(self):
-
+    
         loader = UiLoader()
         loader.registerCustomWidget(FingerTabWidget)
         loader.registerCustomWidget(TreeView)
@@ -1309,7 +1334,7 @@ class RunManager(object):
         self.previous_expansions = {}
 
         # Start the loop that allows compilations to be queued up:
-        self.compile_queue = Queue.Queue()
+        self.compile_queue = queue.Queue()
         self.compile_queue_thread = threading.Thread(target=self.compile_loop)
         self.compile_queue_thread.daemon = True
         self.compile_queue_thread.start()
@@ -1393,7 +1418,11 @@ class RunManager(object):
                                                         'Check selected', self.ui)
         self.action_axes_uncheck_selected = QtWidgets.QAction(QtGui.QIcon(':qtutils/fugue/ui-check-box-uncheck'),
                                                           'Uncheck selected', self.ui)
-
+                                                          
+        # setup header widths
+        self.ui.treeView_axes.header().setStretchLastSection(False)
+        self.ui.treeView_axes.header().setSectionResizeMode(self.AXES_COL_NAME, QtWidgets.QHeaderView.Stretch)
+                                                          
     def setup_groups_tab(self):
         self.groups_model = QtGui.QStandardItemModel()
         self.groups_model.setHorizontalHeaderLabels(['File/group name', 'Active', 'Delete', 'Open/Close'])
@@ -1466,18 +1495,25 @@ class RunManager(object):
         self.ui.pushButton_engage.clicked.connect(self.on_engage_clicked)
         self.ui.pushButton_abort.clicked.connect(self.on_abort_clicked)
         self.ui.pushButton_restart_subprocess.clicked.connect(self.on_restart_subprocess_clicked)
+        
+        # shuffle master control
+        self.ui.pushButton_shuffle.stateChanged.connect(self.on_master_shuffle_clicked)
 
         # Tab closebutton clicked:
         self.ui.tabWidget.tabCloseRequested.connect(self.on_tabCloseRequested)
 
         # Axes tab; right click menu, menu actions, reordering
-        self.ui.treeView_axes.customContextMenuRequested.connect(self.on_treeView_axes_context_menu_requested)
+        # self.ui.treeView_axes.customContextMenuRequested.connect(self.on_treeView_axes_context_menu_requested)
         self.action_axes_check_selected.triggered.connect(self.on_axes_check_selected_triggered)
         self.action_axes_uncheck_selected.triggered.connect(self.on_axes_uncheck_selected_triggered)
         self.ui.toolButton_axis_to_top.clicked.connect(self.on_axis_to_top_clicked)
         self.ui.toolButton_axis_up.clicked.connect(self.on_axis_up_clicked)
         self.ui.toolButton_axis_down.clicked.connect(self.on_axis_down_clicked)
         self.ui.toolButton_axis_to_bottom.clicked.connect(self.on_axis_to_bottom_clicked)
+        # axes tab item changed handler
+        self.axes_model.itemChanged.connect(self.on_axes_item_changed)
+        self.axes_model.rowsRemoved.connect(self.update_global_shuffle_state)
+        self.axes_model.rowsInserted.connect(self.update_global_shuffle_state)
 
         # Groups tab; right click menu, menu actions, open globals file, new globals file, diff globals file,
         self.ui.treeView_groups.customContextMenuRequested.connect(self.on_treeView_groups_context_menu_requested)
@@ -1499,6 +1535,7 @@ class RunManager(object):
         # A context manager with which we can temporarily disconnect the above connection.
         self.groups_model_item_changed_disconnected = DisconnectContextManager(
             self.groups_model.itemChanged, self.on_groups_model_item_changed)
+        
 
         # Tell Windows how to handle our windows in the the taskbar, making pinning work properly and stuff:
         if os.name == 'nt':
@@ -1662,7 +1699,8 @@ class RunManager(object):
             send_to_BLACS = self.ui.checkBox_run_shots.isChecked()
             send_to_runviewer = self.ui.checkBox_view_shots.isChecked()
             labscript_file = self.ui.lineEdit_labscript_file.text()
-            shuffle = self.ui.pushButton_shuffle.isChecked()
+            # even though we shuffle on a per global basis, if ALL of the globals are set to shuffle, then we may as well shuffle again. This helps shuffle shots more randomly than just shuffling within each level (because without this, you would still do all shots with the outer most variable the same, etc)
+            shuffle = self.ui.pushButton_shuffle.checkState() == QtCore.Qt.Checked
             if not labscript_file:
                 raise Exception('Error: No labscript file selected')
             output_folder = self.ui.lineEdit_shot_output_folder.text()
@@ -1671,8 +1709,16 @@ class RunManager(object):
             BLACS_host = self.ui.lineEdit_BLACS_hostname.text()
             logger.info('Parsing globals...')
             active_groups = self.get_active_groups()
+            # Get ordering of expansion globals
+            expansion_order = {}
+            for i in range(self.axes_model.rowCount()):
+                item = self.axes_model.item(i, self.AXES_COL_NAME)
+                shuffle_item = self.axes_model.item(i, self.AXES_COL_SHUFFLE)
+                name = item.data(self.AXES_ROLE_NAME)
+                expansion_order[name] = {'order':i, 'shuffle':shuffle_item.checkState()}
+            
             try:
-                sequenceglobals, shots, evaled_globals, global_hierarchy, expansions = self.parse_globals(active_groups)
+                sequenceglobals, shots, evaled_globals, global_hierarchy, expansions = self.parse_globals(active_groups, expansion_order=expansion_order)
             except Exception as e:
                 raise Exception('Error parsing globals:\n%s\nCompilation aborted.' % str(e))
             logger.info('Making h5 files')
@@ -1741,18 +1787,125 @@ class RunManager(object):
 
     def on_axes_uncheck_selected_triggered(self, *args):
         raise NotImplementedError
-
+        
     def on_axis_to_top_clicked(self, checked):
-        raise NotImplementedError
+        # Get the selection model from the treeview
+        selection_model = self.ui.treeView_axes.selectionModel()    
+        # Create a list of select row indices
+        selected_row_list = [index.row() for index in sorted(selection_model.selectedRows())]
+        # For each row selected
+        for i,row in enumerate(selected_row_list):
+            # only move the row while it is not element 0, and the row above it is not selected
+            # (note that while a row above may have been initially selected, it should by now, be one row higher
+            # since we start moving elements of the list upwards starting from the lowest index)
+            while row > 0 and (row-1) not in selected_row_list:
+                # Remove the selected row
+                items = self.axes_model.takeRow(row)
+                # Add the selected row into a position one above
+                self.axes_model.insertRow(row-1,items)
+                # Since it is now a newly inserted row, select it again
+                selection_model.select(self.axes_model.indexFromItem(items[0]),QtCore.QItemSelectionModel.SelectCurrent|QtCore.QItemSelectionModel.Rows)
+                # reupdate the list of selected indices to reflect this change
+                selected_row_list[i] -= 1
+                row -= 1
+                    
+        self.update_axes_indentation()
 
     def on_axis_up_clicked(self, checked):
-        raise NotImplementedError
+        # Get the selection model from the treeview
+        selection_model = self.ui.treeView_axes.selectionModel()    
+        # Create a list of select row indices
+        selected_row_list = [index.row() for index in sorted(selection_model.selectedRows())]
+        # For each row selected
+        for i,row in enumerate(selected_row_list):
+            # only move the row if it is not element 0, and the row above it is not selected
+            # (note that while a row above may have been initially selected, it should by now, be one row higher
+            # since we start moving elements of the list upwards starting from the lowest index)
+            if row > 0 and (row-1) not in selected_row_list:
+                # Remove the selected row
+                items = self.axes_model.takeRow(row)
+                # Add the selected row into a position one above
+                self.axes_model.insertRow(row-1,items)
+                # Since it is now a newly inserted row, select it again
+                selection_model.select(self.axes_model.indexFromItem(items[0]),QtCore.QItemSelectionModel.SelectCurrent|QtCore.QItemSelectionModel.Rows)
+                # reupdate the list of selected indices to reflect this change
+                selected_row_list[i] -= 1
+                
+        self.update_axes_indentation()
 
     def on_axis_down_clicked(self, checked):
-        raise NotImplementedError
+        # Get the selection model from the treeview
+        selection_model = self.ui.treeView_axes.selectionModel()    
+        # Create a list of select row indices
+        selected_row_list = [index.row() for index in reversed(sorted(selection_model.selectedRows()))]
+        # For each row selected
+        for i,row in enumerate(selected_row_list):
+            # only move the row if it is not the last element, and the row above it is not selected
+            # (note that while a row below may have been initially selected, it should by now, be one row lower
+            # since we start moving elements of the list upwards starting from the highest index)
+            if row < self.axes_model.rowCount()-1 and (row+1) not in selected_row_list:
+                # Remove the selected row
+                items = self.axes_model.takeRow(row)
+                # Add the selected row into a position one above
+                self.axes_model.insertRow(row+1,items)
+                # Since it is now a newly inserted row, select it again
+                selection_model.select(self.axes_model.indexFromItem(items[0]),QtCore.QItemSelectionModel.SelectCurrent|QtCore.QItemSelectionModel.Rows)
+                # reupdate the list of selected indices to reflect this change
+                selected_row_list[i] += 1
+            
+        self.update_axes_indentation()
 
     def on_axis_to_bottom_clicked(self, checked):
-        raise NotImplementedError
+        selection_model = self.ui.treeView_axes.selectionModel()    
+        # Create a list of select row indices
+        selected_row_list = [index.row() for index in reversed(sorted(selection_model.selectedRows()))]
+        # For each row selected
+        for i,row in enumerate(selected_row_list):
+            # only move the row while it is not the last element, and the row above it is not selected
+            # (note that while a row below may have been initially selected, it should by now, be one row lower
+            # since we start moving elements of the list upwards starting from the highest index)
+            while row < self.axes_model.rowCount()-1 and (row+1) not in selected_row_list:
+                # Remove the selected row
+                items = self.axes_model.takeRow(row)
+                # Add the selected row into a position one above
+                self.axes_model.insertRow(row+1,items)
+                # Since it is now a newly inserted row, select it again
+                selection_model.select(self.axes_model.indexFromItem(items[0]),QtCore.QItemSelectionModel.SelectCurrent|QtCore.QItemSelectionModel.Rows)
+                # reupdate the list of selected indices to reflect this change
+                selected_row_list[i] += 1
+                row += 1
+                
+        self.update_axes_indentation()
+        
+    def on_axes_item_changed(self, item):
+        if item.column() == self.AXES_COL_SHUFFLE:
+            self.update_global_shuffle_state()
+            
+    def update_global_shuffle_state(self, *args, **kwargs):
+        all_checked = True
+        none_checked = True
+        for i in range(self.axes_model.rowCount()):
+            check_state = self.axes_model.item(i, self.AXES_COL_SHUFFLE).checkState() == QtCore.Qt.Checked
+            all_checked = all_checked and check_state
+            none_checked = none_checked and not check_state
+            
+        if not all_checked and not none_checked:
+            self.ui.pushButton_shuffle.setTristate(True)
+            self.ui.pushButton_shuffle.setCheckState(QtCore.Qt.PartiallyChecked)
+        elif none_checked:
+            self.ui.pushButton_shuffle.setTristate(False)
+            self.ui.pushButton_shuffle.setCheckState(QtCore.Qt.Unchecked)
+        else:
+            self.ui.pushButton_shuffle.setTristate(False)
+            self.ui.pushButton_shuffle.setCheckState(QtCore.Qt.Checked)
+    
+    def on_master_shuffle_clicked(self, state):
+        if state in [QtCore.Qt.Checked, QtCore.Qt.Unchecked]:
+            self.ui.pushButton_shuffle.setTristate(False)
+            for i in range(self.axes_model.rowCount()):
+                item = self.axes_model.item(i, self.AXES_COL_SHUFFLE)
+                if item.checkState() != state:
+                    self.axes_model.item(i, self.AXES_COL_SHUFFLE).setCheckState(state)
 
     def on_treeView_groups_context_menu_requested(self, point):
         menu = QtWidgets.QMenu(self.ui)
@@ -1780,7 +1933,7 @@ class RunManager(object):
         i = 2
         while new_filename != filenames:
             for filepath, filename in filenames.items():
-                if filenames.values().count(filename) > 1:
+                if list(filenames.values()).count(filename) > 1:
                     new_filename[filepath] = os.sep.join(filepath.split(os.sep)[-i:])
                 else:
                     new_filename[filepath] = filename
@@ -2236,6 +2389,79 @@ class RunManager(object):
         self.ui.pushButton_engage.setEnabled(False)
         QtCore.QTimer.singleShot(1,self.preparse_globals_required.set)
 
+    def update_axes_indentation(self):
+        for i in range(self.axes_model.rowCount()):
+            item = self.axes_model.item(i, self.AXES_COL_NAME)
+            text = item.text().lstrip()
+            text = '    '*i + text
+            item.setText(text)
+            
+    @inmain_decorator()  # Is called by preparser thread
+    def update_axes_tab(self, expansions, dimensions):
+        # get set of expansions
+        expansion_list = []
+        for global_name, expansion in expansions.items():
+            if expansion:
+                if expansion == 'outer':
+                    expansion_list.append('outer '+global_name)
+                else:
+                    expansion_list.append('zip '+expansion)
+                
+        expansion_list = set(expansion_list)
+                
+        # find items to delete
+        for i in reversed(range(self.axes_model.rowCount())):
+            item = self.axes_model.item(i, self.AXES_COL_NAME)
+            name = item.data(self.AXES_ROLE_NAME)
+            if name not in expansion_list:
+                item = self.axes_model.takeRow(i)
+                del item
+            else:
+                length_item = self.axes_model.item(i, self.AXES_COL_LENGTH)
+                if name in dimensions:
+                    length_item.setText("{}".format(dimensions[name]))
+                else:
+                    length_item.setText('Unknown')
+                
+                # remove from expansions list so we don't add it again
+                expansion_list.remove(name)
+            
+        # add new rows
+        for expansion_name in expansion_list:
+            shuffle = self.ui.pushButton_shuffle.checkState() != QtCore.Qt.Unchecked
+            self.add_item_to_axes_model(expansion_name, shuffle, dimensions)
+                
+        self.update_axes_indentation() 
+
+    def add_item_to_axes_model(self, expansion_name, shuffle, dimensions = None):
+        if dimensions is None:
+            dimensions = {}
+        
+        items = []
+        
+        expansion_type, name = expansion_name.split()
+        name_item = QtGui.QStandardItem(name)
+        name_item.setData(expansion_name, self.AXES_ROLE_NAME)
+        if expansion_type == 'outer':
+            name_item.setIcon(QtGui.QIcon(':qtutils/custom/outer'))
+        else:
+            name_item.setIcon(QtGui.QIcon(':qtutils/custom/zip'))
+        items.append(name_item)
+        
+        length = 'Unknown'
+        if expansion_name in dimensions:
+            length = "{}".format(dimensions[expansion_name])
+        length_item = QtGui.QStandardItem(length)
+        items.append(length_item)
+        
+        shuffle_item = QtGui.QStandardItem()
+        shuffle_item.setCheckable(True)
+        shuffle_item.setCheckState(QtCore.Qt.Checked if shuffle else QtCore.Qt.Unchecked)
+        
+        items.append(shuffle_item)
+        
+        self.axes_model.appendRow(items)
+    
     @inmain_decorator()  # Is called by preparser thread
     def update_tabs_parsing_indication(self, active_groups, sequence_globals, evaled_globals, n_shots):
         for group_tab in self.currently_open_groups.values():
@@ -2257,8 +2483,8 @@ class RunManager(object):
         # type changes. If this occurs, we will have to parse again to
         # include the change:
         while True:
-            results = self.parse_globals(active_groups, raise_exceptions=False, expand_globals=False)
-            sequence_globals, shots, evaled_globals, global_hierarchy, expansions = results
+            results = self.parse_globals(active_groups, raise_exceptions=False, expand_globals=False, return_dimensions = True)
+            sequence_globals, shots, evaled_globals, global_hierarchy, expansions, dimensions = results
             n_shots = len(shots)
             expansions_changed = self.guess_expansion_modes(
                 active_groups, evaled_globals, global_hierarchy, expansions)
@@ -2266,11 +2492,12 @@ class RunManager(object):
                 # Now expand globals while parsing to calculate the number of shots.
                 # this must only be done after the expansion type guessing has been updated to avoid exceptions
                 # when changing a zip group from a list to a single value
-                results = self.parse_globals(active_groups, raise_exceptions=False, expand_globals=True)
-                sequence_globals, shots, evaled_globals, global_hierarchy, expansions = results
+                results = self.parse_globals(active_groups, raise_exceptions=False, expand_globals=True, return_dimensions = True)
+                sequence_globals, shots, evaled_globals, global_hierarchy, expansions, dimensions = results
                 n_shots = len(shots)
                 break
         self.update_tabs_parsing_indication(active_groups, sequence_globals, evaled_globals, n_shots)
+        self.update_axes_tab(expansions, dimensions)
 
 
     def preparse_globals_loop(self):
@@ -2694,6 +2921,15 @@ class RunManager(object):
         send_to_BLACS = self.ui.checkBox_run_shots.isChecked()
         shuffle = self.ui.pushButton_shuffle.isChecked()
 
+        # axes tab information
+        axes = []
+        for i in range(self.axes_model.rowCount()):
+            name_item = self.axes_model.item(i, self.AXES_COL_NAME)
+            shuffle_item = self.axes_model.item(i, self.AXES_COL_SHUFFLE)
+            shuffle_state = shuffle_item.checkState()
+            
+            axes.append((name_item.data(self.AXES_ROLE_NAME), 1 if shuffle_state == QtCore.Qt.Checked else 0))
+        
         save_data = {'h5_files_open': h5_files_open,
                      'active_groups': active_groups,
                      'groups_open': groups_open,
@@ -2703,6 +2939,7 @@ class RunManager(object):
                      'send_to_runviewer': send_to_runviewer,
                      'send_to_BLACS': send_to_BLACS,
                      'shuffle': shuffle,
+                     'axes': axes,
                      'BLACS_host': BLACS_host}
         return save_data
 
@@ -2845,6 +3082,13 @@ class RunManager(object):
             pass
         else:
             self.ui.checkBox_run_shots.setChecked(send_to_BLACS)
+        
+        # clear the axes model first
+        if self.axes_model.rowCount():
+            self.axes_model.removeRows(0, self.axes_model.rowCount())
+        # set the state of the global shuffle button. This ensure that if no axes items get loaded afterwards
+        # (e.g. because the globals in the .ini file are no longer expansion globals), then we still have 
+        # an approximate state for the shuffle button that will apply to whatever globals are to be expanded.
         try:
             shuffle = ast.literal_eval(runmanager_config.get('runmanager_state', 'shuffle'))
         except Exception:
@@ -2852,6 +3096,18 @@ class RunManager(object):
         else:
             if shuffle:
                 self.ui.pushButton_shuffle.setChecked(True)
+        # Now load the axes states (order and shuffle). This will also ensure the shuffle button matches the 
+        # state of these items (since we don't save/restore the tri-state nature of the global shuffle button
+        try:
+            axes = ast.literal_eval(runmanager_config.get('runmanager_state', 'axes'))
+        except Exception:
+            pass
+        else:
+            if isinstance(axes, list):
+                # clear model
+                for name, shuffle in axes:
+                    self.add_item_to_axes_model(name, shuffle)
+                self.update_axes_indentation() 
         try:
             BLACS_host = ast.literal_eval(runmanager_config.get('runmanager_state', 'BLACS_host'))
         except Exception:
@@ -2875,10 +3131,10 @@ class RunManager(object):
                         break
                     try:
                         try:
-                            # We do .next() instead of looping over run_files
+                            # We do next() instead of looping over run_files
                             # so that if compilation is aborted we won't
                             # create an extra file unnecessarily.
-                            run_file = run_files.next()
+                            run_file = next(run_files)
                         except StopIteration:
                             self.output_box.output('Ready.\n\n')
                             break
@@ -2905,17 +3161,24 @@ class RunManager(object):
                 zprocess.raise_exception_in_thread(exc_info)
                 continue
 
-    def parse_globals(self, active_groups, raise_exceptions=True, expand_globals=True):
+    def parse_globals(self, active_groups, raise_exceptions=True, expand_globals=True, expansion_order = None, return_dimensions = False):
         sequence_globals = runmanager.get_globals(active_groups)
         #logger.info('got sequence globals')
         evaled_globals, global_hierarchy, expansions = runmanager.evaluate_globals(sequence_globals, raise_exceptions)
         #logger.info('evaluated sequence globals')
         if expand_globals:
-            shots = runmanager.expand_globals(sequence_globals, evaled_globals)
+            if return_dimensions:
+                shots, dimensions = runmanager.expand_globals(sequence_globals, evaled_globals, expansion_order, return_dimensions=return_dimensions)
+            else:
+                shots = runmanager.expand_globals(sequence_globals, evaled_globals, expansion_order)
         else:
             shots = []
+            dimensions = {}
         #logger.info('expanded sequence globals')
-        return sequence_globals, shots, evaled_globals, global_hierarchy, expansions
+        if return_dimensions:
+            return sequence_globals, shots, evaled_globals, global_hierarchy, expansions, dimensions
+        else:
+            return sequence_globals, shots, evaled_globals, global_hierarchy, expansions
 
     def guess_expansion_modes(self, active_groups, evaled_globals, global_hierarchy, expansions):
         """This function is designed to be called iteratively. It changes the
@@ -2955,13 +3218,24 @@ class RunManager(object):
                 try:
                     previous_value = self.previous_evaled_globals[group_name][global_name]
                 except KeyError:
-                    # This variable is only used to guess the expansion type
-                    # so we can set it to '0' which will result in an
+                    # This variable is used to guess the expansion type
+                    # 
+                    # If we already have an expansion specified for this, but
+                    # don't have a previous value, then we should use the 
+                    # new_value for the guess as we are likely loading from HDF5
+                    # file for the first time (and either way, don't want to 
+                    # overwrite what the user has put in the expansion type)
+                    #
+                    # If we don't have an expansion...
+                    # then we set it to '0' which will result in an
                     # expansion type guess of '' (emptys string) This will
                     # either result in nothing being done to the expansion
                     # type or the expansion type being found to be 'outer',
                     # which will then make it go through the machinery below
-                    previous_value = 0
+                    if global_name in expansions and expansions[global_name]:
+                        previous_value = new_value
+                    else:
+                        previous_value = 0
 
                 new_guess = runmanager.guess_expansion_type(new_value)
                 previous_guess = runmanager.guess_expansion_type(previous_value)
@@ -2995,6 +3269,30 @@ class RunManager(object):
                     if expansions[dependency]:
                         return True
 
+        def set_expansion_type_guess(expansion_types, expansions, global_name, expansion_to_set, new=True):
+            if new:
+                key = 'new_guess'
+            else:
+                key = 'previous_guess'
+                
+            # debug logging
+            log_if_global(global_name, [], 'setting expansion type for new dependency' if new else 'setting expansion type for old dependencies')
+            
+            
+            # only do this if the expansion is *not* already set to a specific zip group
+            if global_name in expansions and expansions[global_name] != '' and expansions[global_name] != 'outer':
+                expansion_types[global_name][key] = expansions[global_name]
+                
+                # debug logging
+                log_if_global(global_name, [], 'Using existing expansion %s for %s'%(expansions[global_name], global_name))
+            else:
+                expansion_types[global_name][key] = expansion_to_set
+                expansions[global_name] = expansion_to_set
+                
+                # debug logging
+                log_if_global(global_name, [], 'Using existing expansion %s for %s'%(expansion_to_set, global_name))
+            
+        
         for global_name in sorted(expansion_types):
             # we have a global that does not depend on anything that has an
             # expansion type of 'outer'
@@ -3005,11 +3303,10 @@ class RunManager(object):
                 # if this global has other globals that use it, then add them
                 # all to a zip group with the name of this global
                 if current_dependencies:
-                    for dependency in current_dependencies:
-                        expansion_types[dependency]['new_guess'] = str(global_name)
-                        expansions[dependency] = str(global_name)
-                    expansion_types[global_name]['new_guess'] = str(global_name)
-                    expansions[global_name] = str(global_name)
+                    for dependency in current_dependencies:                        
+                        set_expansion_type_guess(expansion_types, expansions, dependency,  str(global_name))
+                            
+                    set_expansion_type_guess(expansion_types, expansions, global_name,  str(global_name))
 
         for global_name in sorted(self.previous_expansion_types):
             if (not global_depends_on_global_with_outer_product(
@@ -3021,9 +3318,9 @@ class RunManager(object):
                 if old_dependencies:
                     for dependency in old_dependencies:
                         if dependency in expansion_types:
-                            expansion_types[dependency]['previous_guess'] = str(global_name)
+                            set_expansion_type_guess(expansion_types, self.previous_expansions, dependency, str(global_name), new=False)
                     if global_name in expansion_types:
-                        expansion_types[global_name]['previous_guess'] = str(global_name)
+                        set_expansion_type_guess(expansion_types, self.previous_expansions, global_name, str(global_name), new=False)
 
         for global_name, guesses in expansion_types.items():
             if guesses['new_guess'] != guesses['previous_guess']:
