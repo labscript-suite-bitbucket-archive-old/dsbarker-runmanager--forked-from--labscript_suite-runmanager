@@ -23,6 +23,18 @@ import sys
 import errno
 import labscript_utils.excepthook
 
+try:
+    from labscript_utils import check_version
+except ImportError:
+    raise ImportError('Require labscript_utils > 2.1.0')
+
+check_version('labscript_utils', '2.10.0', '3')
+# Splash screen
+from labscript_utils.splash import Splash
+splash = Splash(os.path.join(os.path.dirname(__file__), 'runmanager.svg'))
+splash.show()
+
+splash.update_text('importing standard library modules')
 import time
 import contextlib
 import subprocess
@@ -31,6 +43,7 @@ import socket
 import ast
 import pprint
 
+splash.update_text('importing matplotlib')
 # Evaluation of globals happens in a thread with the pylab module imported.
 # Although we don't care about plotting, importing pylab makes Qt calls. We
 # can't have that from a non main thread, so we'll just disable matplotlib's
@@ -42,25 +55,24 @@ import signal
 # Quit on ctrl-c
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-try:
-    from labscript_utils import check_version
-except ImportError:
-    raise ImportError('Require labscript_utils > 2.1.0')
-
-check_version('labscript_utils', '2', '3')
+splash.update_text('importing Qt')
 check_version('qtutils', '2.0.0', '3.0.0')
-check_version('zprocess', '1.1.5', '3.0')
+
+splash.update_text('importing pandas')
 check_version('pandas', '0.13', '2')
 
 from qtutils.qt import QtCore, QtGui, QtWidgets
 from qtutils.qt.QtCore import pyqtSignal as Signal
 
-import zprocess.locking
 from zmq import ZMQError
 
+splash.update_text('importing labscript suite modules')
+check_version('labscript_utils', '2.11.0', '3')
+from labscript_utils.ls_zprocess import zmq_get, ProcessTree
 from labscript_utils.labconfig import LabConfig, config_prefix
 from labscript_utils.setup_logging import setup_logging
 import labscript_utils.shared_drive as shared_drive
+from zprocess import raise_exception_in_thread
 import runmanager
 
 from qtutils import inmain, inmain_decorator, UiLoader, inthread, DisconnectContextManager
@@ -71,8 +83,10 @@ import qtutils.icons
 runmanager_dir = os.path.dirname(os.path.realpath(__file__))
 os.chdir(runmanager_dir)
 
+process_tree = ProcessTree.instance()
+
 # Set a meaningful name for zprocess.locking's client id:
-zprocess.locking.set_client_process_name('runmanager')
+process_tree.zlock_client.set_process_name('runmanager')
 
 
 def log_if_global(g, g_list, message):
@@ -150,20 +164,6 @@ def scroll_treeview_to_row_if_current(treeview, item):
     if index.row() == current_row:
         treeview.scrollTo(index)
         horizontal_scrollbar.setValue(existing_horizontal_position)
-
-
-class KeyPressQApplication(QtWidgets.QApplication):
-
-    """A Qapplication that emits a signal keyPress(key) on keypresses"""
-    keyPress = Signal(int, QtCore.Qt.KeyboardModifiers, bool)
-    keyRelease = Signal(int, QtCore.Qt.KeyboardModifiers, bool)
-
-    def notify(self, object, event):
-        if event.type() == QtCore.QEvent.KeyPress and event.key():
-            self.keyPress.emit(event.key(), event.modifiers(), event.isAutoRepeat())
-        elif event.type() == QtCore.QEvent.KeyRelease and event.key():
-            self.keyRelease.emit(event.key(), event.modifiers(), event.isAutoRepeat())
-        return QtWidgets.QApplication.notify(self, object, event)
 
 
 class FingerTabBarWidget(QtWidgets.QTabBar):
@@ -332,15 +332,6 @@ class FingerTabWidget(QtWidgets.QTabWidget):
     def __init__(self, parent, *args):
         QtWidgets.QTabWidget.__init__(self, parent, *args)
         self.setTabBar(FingerTabBarWidget(self))
-
-    def keyPressEvent(self, event):
-        if event.modifiers() & QtCore.Qt.ControlModifier:
-            if event.key() in (QtCore.Qt.Key_Tab, QtCore.Qt.Key_Backtab):
-                # We are handling ctrl-tab events at the level of the whole
-                # application, so ignore them here so as not to double up.
-                event.ignore()
-                return
-        return QtWidgets.QTabWidget.keyPressEvent(self, event)
 
     def addTab(self, *args, **kwargs):
         closeable = kwargs.pop('closable', False)
@@ -1260,7 +1251,7 @@ class RunManager(object):
     GROUPS_DUMMY_ROW_TEXT = '<Click to add group>'
 
     def __init__(self):
-    
+        splash.update_text('loading graphical interface')
         loader = UiLoader()
         loader.registerCustomWidget(FingerTabWidget)
         loader.registerCustomWidget(TreeView)
@@ -1339,9 +1330,11 @@ class RunManager(object):
         self.compile_queue_thread.daemon = True
         self.compile_queue_thread.start()
 
+        splash.update_text('starting compiler subprocess')
         # Start the compiler subprocess:
-        self.to_child, self.from_child, self.child = zprocess.subprocess_with_queues(
-            'batch_compiler.py', self.output_box.port)
+        self.to_child, self.from_child, self.child = process_tree.subprocess(
+            'batch_compiler.py', output_redirection_port=self.output_box.port
+        )
 
         # Start a thread to monitor the time of day and create new shot output
         # folders for each day:
@@ -1376,6 +1369,7 @@ class RunManager(object):
             # so that the GUI pops up faster in the meantime
             self.ui.firstPaint.connect(lambda: QtCore.QTimer.singleShot(50, load_the_config_file))
 
+        splash.update_text('done')
         self.ui.show()
 
     def setup_config(self):
@@ -1536,6 +1530,13 @@ class RunManager(object):
         self.groups_model_item_changed_disconnected = DisconnectContextManager(
             self.groups_model.itemChanged, self.on_groups_model_item_changed)
         
+        # Keyboard shortcuts:
+        engage_shortcut = QtWidgets.QShortcut('F5', self.ui,
+            lambda: self.ui.pushButton_engage.clicked.emit(False))
+        engage_shortcut.setAutoRepeat(False)
+        QtWidgets.QShortcut('ctrl+W', self.ui, self.close_current_tab)
+        QtWidgets.QShortcut('ctrl+Tab', self.ui, lambda: self.switch_tabs(+1))
+        QtWidgets.QShortcut('ctrl+shift+Tab', self.ui, lambda: self.switch_tabs(-1))
 
         # Tell Windows how to handle our windows in the the taskbar, making pinning work properly and stuff:
         if os.name == 'nt':
@@ -1556,30 +1557,17 @@ class RunManager(object):
         self.to_child.put(['quit', None])
         return True
 
-    def on_keyPress(self, key, modifiers, is_autorepeat):
-        if key == QtCore.Qt.Key_F5 and modifiers == QtCore.Qt.NoModifier and not is_autorepeat:
-            self.ui.pushButton_engage.setDown(True)
-        elif key == QtCore.Qt.Key_W and modifiers == QtCore.Qt.ControlModifier and not is_autorepeat:
-            current_tab_widget = self.ui.tabWidget.currentWidget()
-            for (globals_file, group_name), tab in self.currently_open_groups.items():
-                if tab.ui is current_tab_widget:
-                    self.close_group(globals_file, group_name)
-        elif modifiers & QtCore.Qt.ControlModifier:
-            if key == QtCore.Qt.Key_Tab:
-                change = 1
-            elif key == QtCore.Qt.Key_Backtab:
-                change = -1
-            else:
-                return
-            current_index = self.ui.tabWidget.currentIndex()
-            n_tabs = self.ui.tabWidget.count()
-            new_index = (current_index + change) % n_tabs
-            self.ui.tabWidget.setCurrentIndex(new_index)
+    def close_current_tab(self):
+        current_tab_widget = self.ui.tabWidget.currentWidget()
+        for (globals_file, group_name), tab in self.currently_open_groups.items():
+            if tab.ui is current_tab_widget:
+                self.close_group(globals_file, group_name)
 
-    def on_keyRelease(self, key, modifiers, is_autorepeat):
-        if key == QtCore.Qt.Key_F5 and not is_autorepeat:
-            self.ui.pushButton_engage.setDown(False)
-            self.ui.pushButton_engage.clicked.emit(False)
+    def switch_tabs(self, change):
+        current_index = self.ui.tabWidget.currentIndex()
+        n_tabs = self.ui.tabWidget.count()
+        new_index = (current_index + change) % n_tabs
+        self.ui.tabWidget.setCurrentIndex(new_index)
 
     def on_output_popout_button_clicked(self):
         if self.output_box_is_popped_out:
@@ -1762,8 +1750,9 @@ class RunManager(object):
         else:
             self.output_box.output('done.\n')
         self.output_box.output('Spawning new compiler subprocess...')
-        self.to_child, self.from_child, self.child = zprocess.subprocess_with_queues(
-            'batch_compiler.py', self.output_box.port)
+        self.to_child, self.from_child, self.child = process_tree.subprocess(
+            'batch_compiler.py', output_redirection_port=self.output_box.port
+        )
         self.output_box.output('done.\n')
         self.output_box.output('Ready.\n\n')
 
@@ -2516,7 +2505,7 @@ class RunManager(object):
                 # Raise the error, but keep going so we don't take down the
                 # whole thread if there is a bug.
                 exc_info = sys.exc_info()
-                zprocess.raise_exception_in_thread(exc_info)
+                raise_exception_in_thread(exc_info)
                 continue
 
     def get_group_item_by_name(self, globals_file, group_name, column, previous_name=None):
@@ -3013,7 +3002,7 @@ class RunManager(object):
                         self.open_globals_file(globals_file)
                         self.last_opened_globals_folder = os.path.dirname(globals_file)
                     except Exception:
-                        zprocess.raise_exception_in_thread(sys.exc_info())
+                        raise_exception_in_thread(sys.exc_info())
                         continue
                 else:
                     self.output_box.output('\nWarning: globals file %s no longer exists\n' % globals_file, red=True)
@@ -3158,7 +3147,7 @@ class RunManager(object):
                 # Raise it so whatever bug it is gets seen, but keep going so
                 # the thread keeps functioning:
                 exc_info = sys.exc_info()
-                zprocess.raise_exception_in_thread(exc_info)
+                raise_exception_in_thread(exc_info)
                 continue
 
     def parse_globals(self, active_groups, raise_exceptions=True, expand_globals=True, expansion_order = None, return_dimensions = False):
@@ -3361,7 +3350,7 @@ class RunManager(object):
         agnostic_path = shared_drive.path_to_agnostic(run_file)
         self.output_box.output('Submitting run file %s.\n' % os.path.basename(run_file))
         try:
-            response = zprocess.zmq_get(port, BLACS_hostname, data=agnostic_path)
+            response = zmq_get(port, BLACS_hostname, data=agnostic_path)
             if 'added successfully' in response:
                 self.output_box.output(response)
             else:
@@ -3374,7 +3363,7 @@ class RunManager(object):
         runviewer_port = int(self.exp_config.get('ports', 'runviewer'))
         agnostic_path = shared_drive.path_to_agnostic(run_file)
         try:
-            response = zprocess.zmq_get(runviewer_port, 'localhost', data='hello', timeout=1)
+            response = zmq_get(runviewer_port, 'localhost', data='hello', timeout=1)
             if 'hello' not in response:
                 raise Exception(response)
         except Exception as e:
@@ -3393,12 +3382,12 @@ class RunManager(object):
                                      stdin=devnull, stdout=devnull, stderr=devnull, close_fds=True)
                     os._exit(0)
             try:
-                zprocess.zmq_get(runviewer_port, 'localhost', data='hello', timeout=15)
+                zmq_get(runviewer_port, 'localhost', data='hello', timeout=15)
             except Exception as e:
                 self.output_box.output('Couldn\'t submit shot to runviewer: %s\n\n' % str(e), red=True)
 
         try:
-            response = zprocess.zmq_get(runviewer_port, 'localhost', data=agnostic_path, timeout=0.5)
+            response = zmq_get(runviewer_port, 'localhost', data=agnostic_path, timeout=0.5)
             if 'ok' not in response:
                 raise Exception(response)
             else:
@@ -3410,9 +3399,8 @@ if __name__ == "__main__":
     logger = setup_logging('runmanager')
     labscript_utils.excepthook.set_logger(logger)
     logger.info('\n\n===============starting===============\n')
-    qapplication = KeyPressQApplication(sys.argv)
+    qapplication = QtWidgets.QApplication(sys.argv)
     qapplication.setAttribute(QtCore.Qt.AA_DontShowIconsInMenus, False)
     app = RunManager()
-    qapplication.keyPress.connect(app.on_keyPress)
-    qapplication.keyRelease.connect(app.on_keyRelease)
+    splash.hide()
     sys.exit(qapplication.exec_())
