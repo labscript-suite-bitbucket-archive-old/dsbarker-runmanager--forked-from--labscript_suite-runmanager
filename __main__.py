@@ -20,7 +20,6 @@ else:
 
 import os
 import sys
-import errno
 import labscript_utils.excepthook
 
 try:
@@ -39,9 +38,9 @@ import time
 import contextlib
 import subprocess
 import threading
-import socket
 import ast
 import pprint
+import traceback
 
 splash.update_text('importing matplotlib')
 # Evaluation of globals happens in a thread with the pylab module imported.
@@ -56,7 +55,7 @@ import signal
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 splash.update_text('importing Qt')
-check_version('qtutils', '2.0.0', '3.0.0')
+check_version('qtutils', '2.2.2', '3.0.0')
 
 splash.update_text('importing pandas')
 check_version('pandas', '0.13', '2')
@@ -64,19 +63,26 @@ check_version('pandas', '0.13', '2')
 from qtutils.qt import QtCore, QtGui, QtWidgets
 from qtutils.qt.QtCore import pyqtSignal as Signal
 
-from zmq import ZMQError
-
 splash.update_text('importing labscript suite modules')
 check_version('labscript_utils', '2.11.0', '3')
-from labscript_utils.ls_zprocess import zmq_get, ProcessTree
-from labscript_utils.labconfig import LabConfig, config_prefix
+from labscript_utils.ls_zprocess import zmq_get, ProcessTree, ZMQServer
+from labscript_utils.labconfig import LabConfig
 from labscript_utils.setup_logging import setup_logging
 import labscript_utils.shared_drive as shared_drive
+from labscript_utils import dedent
 from zprocess import raise_exception_in_thread
 import runmanager
+import runmanager.remote
 
-from qtutils import inmain, inmain_decorator, UiLoader, inthread, DisconnectContextManager
-from qtutils.outputbox import OutputBox
+from qtutils import (
+    inmain,
+    inmain_decorator,
+    UiLoader,
+    inthread,
+    DisconnectContextManager,
+    qtlock,
+)
+from labscript_utils.qtwidgets.outputbox import OutputBox
 import qtutils.icons
 
 # Set working directory to runmanager folder, resolving symlinks
@@ -108,6 +114,18 @@ def log_if_global(g, g_list, message):
         logger.info(message)
 
     
+def composite_colors(r0, g0, b0, a0, r1, g1, b1, a1):
+    """composite a second colour over a first with given alpha values and return the
+    result"""
+    a0 /= 255
+    a1 /= 255
+    a = a0 + a1 - a0 * a1
+    r = (a1 * r1 + (1 - a1) * a0 * r0) / a
+    g = (a1 * g1 + (1 - a1) * a0 * g0) / a
+    b = (a1 * b1 + (1 - a1) * a0 * b0) / a
+    return [int(round(x)) for x in (r, g, b, 255 * a)]
+
+
 def set_win_appusermodel(window_id):
     from labscript_utils.winshell import set_appusermodel, appids, app_descriptions
     icon_path = os.path.abspath('runmanager.ico')
@@ -131,16 +149,6 @@ def question_dialog(message):
     return (reply == QtWidgets.QMessageBox.Yes)
 
 
-def mkdir_p(path):
-    try:
-        os.makedirs(path)
-    except OSError as exc:
-        if exc.errno == errno.EEXIST and os.path.isdir(path):
-            pass
-        else:
-            raise
-
-
 @contextlib.contextmanager
 def nested(*contextmanagers):
     if contextmanagers:
@@ -151,18 +159,17 @@ def nested(*contextmanagers):
         yield
 
 
-def scroll_treeview_to_row_if_current(treeview, item):
-    """Checks to see if the item is in the row of the current item.
-    If it is, scrolls vertically to ensure that row is visible.
-    This is done by recording the horizontal scroll position,
-    then using QTreeView.scrollTo(), and then restoring the horizontal
-    position"""
-    horizontal_scrollbar = treeview.horizontalScrollBar()
+def scroll_view_to_row_if_current(view, item):
+    """Checks to see if the item is in the row of the current item. If it is, scrolls
+    the treeview/tableview vertically to ensure that row is visible. This is done by
+    recording the horizontal scroll position, then using view.scrollTo(), and then
+    restoring the horizontal position"""
+    horizontal_scrollbar = view.horizontalScrollBar()
     existing_horizontal_position = horizontal_scrollbar.value()
     index = item.index()
-    current_row = treeview.currentIndex().row()
+    current_row = view.currentIndex().row()
     if index.row() == current_row:
-        treeview.scrollTo(index)
+        view.scrollTo(index)
         horizontal_scrollbar.setValue(existing_horizontal_position)
 
 
@@ -284,6 +291,7 @@ class FingerTabBarWidget(QtWidgets.QTabBar):
 class TabToolButton(QtWidgets.QToolButton):
     def __init__(self, *args, **kwargs):
         QtWidgets.QToolButton.__init__(self, *args, **kwargs)
+        self.setFocusPolicy(QtCore.Qt.NoFocus)
 
     def paintEvent(self, event):
         painter = QtWidgets.QStylePainter(self)
@@ -360,36 +368,43 @@ class FingerTabWidget(QtWidgets.QTabWidget):
                 break
 
 
-class TreeView(QtWidgets.QTreeView):
+class ItemView(object):
+    """Mixin for QTableView and QTreeView that emits a custom signal leftClicked(index)
+    after a left click on a valid index, and doubleLeftClicked(index) (in addition) on
+    double click. Also has modified tab and arrow key behaviour and custom selection
+    highlighting."""
     leftClicked = Signal(QtCore.QModelIndex)
     doubleLeftClicked = Signal(QtCore.QModelIndex)
-    """A QTreeview that emits a custom signal leftClicked(index) after a left
-    click on a valid index, and doubleLeftClicked(index) (in addition) on
-    double click. Also has modified tab and arrow key behaviour."""
+
+    COLOR_HIGHLIGHT = "#40308CC6" # Semitransparent blue
 
     def __init__(self, *args):
-        QtWidgets.QTreeView.__init__(self, *args)
+        super(ItemView, self).__init__(*args)
         self._pressed_index = None
         self._double_click = False
-        self._ROLE_IGNORE_TABNEXT = None
         self.setAutoScroll(False)
-
-    def setRoleIgnoreTabNext(self, role):
-        """Tell the Treeview what model role it should look in for a boolean
-        saying whether to ignore the MoveNext cursor action. This will cause
-        cells marked as such to simply end editing when tab is pressed,
-        without starting editing on any other call."""
-        self._ROLE_IGNORE_TABNEXT = role
+        p = self.palette()
+        for group in [QtGui.QPalette.Active, QtGui.QPalette.Inactive]:
+            p.setColor(
+                group,
+                QtGui.QPalette.Highlight,
+                QtGui.QColor(self.COLOR_HIGHLIGHT))
+            p.setColor(
+                group,
+                QtGui.QPalette.HighlightedText,
+                p.color(QtGui.QPalette.Active, QtGui.QPalette.Foreground)
+            )
+        self.setPalette(p)
 
     def mousePressEvent(self, event):
-        result = QtWidgets.QTreeView.mousePressEvent(self, event)
+        result = super(ItemView, self).mousePressEvent(event)
         index = self.indexAt(event.pos())
         if event.button() == QtCore.Qt.LeftButton and index.isValid():
             self._pressed_index = self.indexAt(event.pos())
         return result
 
     def leaveEvent(self, event):
-        result = QtWidgets.QTreeView.leaveEvent(self, event)
+        result = super(ItemView, self).leaveEvent(event)
         self._pressed_index = None
         self._double_click = False
         return result
@@ -397,7 +412,7 @@ class TreeView(QtWidgets.QTreeView):
     def mouseDoubleClickEvent(self, event):
         # Ensure our left click event occurs regardless of whether it is the
         # second click in a double click or not
-        result = QtWidgets.QTreeView.mouseDoubleClickEvent(self, event)
+        result = super(ItemView, self).mouseDoubleClickEvent(event)
         index = self.indexAt(event.pos())
         if event.button() == QtCore.Qt.LeftButton and index.isValid():
             self._pressed_index = self.indexAt(event.pos())
@@ -405,7 +420,7 @@ class TreeView(QtWidgets.QTreeView):
         return result
 
     def mouseReleaseEvent(self, event):
-        result = QtWidgets.QTreeView.mouseReleaseEvent(self, event)
+        result = super(ItemView, self).mouseReleaseEvent(event)
         index = self.indexAt(event.pos())
         if event.button() == QtCore.Qt.LeftButton and index.isValid() and index == self._pressed_index:
             self.leftClicked.emit(index)
@@ -415,122 +430,250 @@ class TreeView(QtWidgets.QTreeView):
         self._double_click = False
         return result
 
-    def event(self, event):
-        if (event.type() == QtCore.QEvent.ShortcutOverride
-                and event.key() in [QtCore.Qt.Key_Enter, QtCore.Qt.Key_Return]):
-            event.accept()
-            item = self.model().itemFromIndex(self.currentIndex())
-            if item is not None and item.isEditable():
-                if self.state() != QtWidgets.QTreeView.EditingState:
-                    self.edit(self.currentIndex())
-            else:
-                # Enter on non-editable items simulates a left click:
-                self.leftClicked.emit(self.currentIndex())
-            return True
-        else:
-            return QtWidgets.QTreeView.event(self, event)
-
     def keyPressEvent(self, event):
-        if event.key() == QtCore.Qt.Key_Space:
+        if event.key() in [QtCore.Qt.Key_Space, QtCore.Qt.Key_Enter, QtCore.Qt.Key_Return]:
             item = self.model().itemFromIndex(self.currentIndex())
-            if not item.isEditable():
-                # Space on non-editable items simulates a left click:
+            if item.isEditable():
+                # Space/enter edits editable items:
+                self.edit(self.currentIndex())
+            else:
+                # Space/enter on non-editable items simulates a left click:
                 self.leftClicked.emit(self.currentIndex())
-        return QtWidgets.QTreeView.keyPressEvent(self, event)
+        return super(ItemView, self).keyPressEvent(event)
 
     def moveCursor(self, cursor_action, keyboard_modifiers):
         current_index = self.currentIndex()
         current_row, current_column = current_index.row(), current_index.column()
-        if cursor_action == QtWidgets.QTreeView.MoveUp:
+        if cursor_action == QtWidgets.QAbstractItemView.MoveUp:
             return current_index.sibling(current_row - 1, current_column)
-        elif cursor_action == QtWidgets.QTreeView.MoveDown:
+        elif cursor_action == QtWidgets.QAbstractItemView.MoveDown:
             return current_index.sibling(current_row + 1, current_column)
-        elif cursor_action == QtWidgets.QTreeView.MoveLeft:
+        elif cursor_action == QtWidgets.QAbstractItemView.MoveLeft:
             return current_index.sibling(current_row, current_column - 1)
-        elif cursor_action == QtWidgets.QTreeView.MoveRight:
+        elif cursor_action == QtWidgets.QAbstractItemView.MoveRight:
             return current_index.sibling(current_row, current_column + 1)
-        elif cursor_action == QtWidgets.QTreeView.MovePrevious:
+        elif cursor_action == QtWidgets.QAbstractItemView.MovePrevious:
             return current_index.sibling(current_row, current_column - 1)
-        elif cursor_action == QtWidgets.QTreeView.MoveNext:
-            item = self.model().itemFromIndex(self.currentIndex())
-            if (item is not None and self._ROLE_IGNORE_TABNEXT is not None
-                    and item.data(self._ROLE_IGNORE_TABNEXT)):
-                # A null index means end editing and don't go anywhere:
-                return QtCore.QModelIndex()
+        elif cursor_action == QtWidgets.QAbstractItemView.MoveNext:
             return current_index.sibling(current_row, current_column + 1)
         else:
-            return QtWidgets.QTreeView.moveCursor(self, cursor_action, keyboard_modifiers)
+            return super(ItemView, self).moveCursor(cursor_action, keyboard_modifiers)
+
+
+class TreeView(ItemView, QtWidgets.QTreeView):
+    """Treeview version of our customised ItemView"""
+    def __init__(self, parent=None):
+        super(TreeView, self).__init__(parent)
+        # Set columns to their minimum size, disabling resizing. Caller may still
+        # configure a specific section to stretch:
+        self.header().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeToContents
+        )
+        self.setItemDelegate(ItemDelegate(self))
+
+
+class TableView(ItemView, QtWidgets.QTableView):
+    """TableView version of our customised ItemView"""
+    def __init__(self, parent=None):
+        super(TableView, self).__init__(parent)
+        # Set rows and columns to the minimum size, disabling interactive resizing.
+        # Caller may still configure a specific column to stretch:
+        self.verticalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeToContents
+        )
+        self.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeToContents
+        )
+        self.horizontalHeader().sectionResized.connect(self.on_column_resized)
+        self.setItemDelegate(ItemDelegate(self))
+        self.verticalHeader().hide()
+        self.setShowGrid(False)
+        self.horizontalHeader().setHighlightSections(False)
+
+    def on_column_resized(self, col):
+        for row in range(self.model().rowCount()):
+            self.resizeRowToContents(row)
 
 
 class AlternatingColorModel(QtGui.QStandardItemModel):
 
-    def __init__(self, treeview):
+    def __init__(self, view):
         QtGui.QStandardItemModel.__init__(self)
         # How much darker in each channel is the alternate base color compared
         # to the base color?
-        palette = treeview.palette()
-        normal_color = palette.color(QtGui.QPalette.Base)
-        alternate_color = palette.color(QtGui.QPalette.AlternateBase)
-        r, g, b, a = normal_color.getRgb()
-        alt_r, alt_g, alt_b, alt_a = alternate_color.getRgb()
+        self.view = view
+        palette = view.palette()
+        self.normal_color = palette.color(QtGui.QPalette.Base)
+        self.alternate_color = palette.color(QtGui.QPalette.AlternateBase)
+        r, g, b, a = self.normal_color.getRgb()
+        alt_r, alt_g, alt_b, alt_a = self.alternate_color.getRgb()
         self.delta_r = alt_r - r
         self.delta_g = alt_g - g
         self.delta_b = alt_b - b
         self.delta_a = alt_a - a
 
         # A cache, store brushes so we don't have to recalculate them. Is faster.
-        self.alternate_brushes = {}
+        self.bg_brushes = {}
+
+    def get_bgbrush(self, normal_brush, alternate, selected):
+        """Get cell colour as a function of its ordinary colour, whether it is on an odd
+        row, and whether it is selected."""
+        normal_rgb = normal_brush.color().getRgb() if normal_brush is not None else None
+        try:
+            return self.bg_brushes[normal_rgb, alternate, selected]
+        except KeyError:
+            pass
+        # Get the colour of the cell with alternate row shading:
+        if normal_rgb is None:
+            # No colour has been set. Use palette colours:
+            if alternate:
+                bg_color = self.alternate_color
+            else:
+                bg_color = self.normal_color
+        else:
+            bg_color = normal_brush.color()
+            if alternate:
+                # Modify alternate rows:
+                r, g, b, a = normal_rgb
+                alt_r = min(max(r + self.delta_r, 0), 255)
+                alt_g = min(max(g + self.delta_g, 0), 255)
+                alt_b = min(max(b + self.delta_b, 0), 255)
+                alt_a = min(max(a + self.delta_a, 0), 255)
+                bg_color = QtGui.QColor(alt_r, alt_g, alt_b, alt_a)
+
+        # If parent is a TableView, we handle selection highlighting as part of the
+        # background colours:
+        if selected and isinstance(self.view, QtWidgets.QTableView):
+            # Overlay highlight colour:
+            r_s, g_s, b_s, a_s = QtGui.QColor(ItemView.COLOR_HIGHLIGHT).getRgb()
+            r_0, g_0, b_0, a_0 = bg_color.getRgb()
+            rgb = composite_colors(r_0, g_0, b_0, a_0, r_s, g_s, b_s, a_s)
+            bg_color = QtGui.QColor(*rgb)
+
+        brush = QtGui.QBrush(bg_color)
+        self.bg_brushes[normal_rgb, alternate, selected] = brush
+        return brush
 
     def data(self, index, role):
-        """When background color data is being requested, returns modified
-       colours for every second row, according to the palette of the treeview.
-       This has the effect of making the alternate colours visible even when
-       custom colors have been set - the same shading will be applied to the
-       custom colours. Only really looks sensible when the normal and
-       alternate colors are similar."""
-        if role == QtCore.Qt.BackgroundRole and index.row() % 2:
+        """When background color data is being requested, returns modified colours for
+        every second row, according to the palette of the view. This has the effect of
+        making the alternate colours visible even when custom colors have been set - the
+        same shading will be applied to the custom colours. Only really looks sensible
+        when the normal and alternate colors are similar. Also applies selection
+        highlight colour (using ItemView.COLOR_HIGHLIGHT), similarly with alternate-row
+        shading, for the case of a QTableView."""
+        if role == QtCore.Qt.BackgroundRole:
             normal_brush = QtGui.QStandardItemModel.data(self, index, QtCore.Qt.BackgroundRole)
-            if normal_brush is not None:
-                normal_color = normal_brush.color()
-                try:
-                    return self.alternate_brushes[normal_color.rgb()]
-                except KeyError:
-                    r, g, b, a = normal_color.getRgb()
-                    alt_r = min(max(r + self.delta_r, 0), 255)
-                    alt_g = min(max(g + self.delta_g, 0), 255)
-                    alt_b = min(max(b + self.delta_b, 0), 255)
-                    alt_a = min(max(a + self.delta_a, 0), 255)
-                    alternate_color = QtGui.QColor(alt_r, alt_g, alt_b, alt_a)
-                    alternate_brush = QtGui.QBrush(alternate_color)
-                    self.alternate_brushes[normal_color.rgb()] = alternate_brush
-                    return alternate_brush
+            selected = index in self.view.selectedIndexes()
+            alternate = index.row() % 2
+            return self.get_bgbrush(normal_brush, alternate, selected)
         return QtGui.QStandardItemModel.data(self, index, role)
+
+
+class Editor(QtWidgets.QTextEdit):
+    """Popup editor with word wrapping and automatic resizing."""
+    def __init__(self, parent):
+        QtWidgets.QTextEdit.__init__(self, parent)
+        self.setWordWrapMode(QtGui.QTextOption.WordWrap)
+        self.setAcceptRichText(False)
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.textChanged.connect(self.update_size)
+        self.initial_height = None
+
+    def update_size(self):
+        if self.initial_height is not None:
+            # Temporarily shrink back to the initial height, just so that the document
+            # size below returns the preferred size rather than the current size.
+            # QTextDocument doesn't have a sizeHint of minimumSizeHint method, so this
+            # is the best we can do to get its minimum size.
+            self.setFixedHeight(self.initial_height)
+        preferred_height = self.document().size().toSize().height()
+        # Do not shrink smaller than the initial height:
+        if self.initial_height is not None and preferred_height >= self.initial_height:
+            self.setFixedHeight(preferred_height)
+
+    def resizeEvent(self, event):
+        result = QtWidgets.QTextEdit.resizeEvent(self, event)
+        # Record the initial height after it is first set:
+        if self.initial_height is None:
+            self.initial_height = self.height()
+        return result
+        
 
 
 class ItemDelegate(QtWidgets.QStyledItemDelegate):
 
-    """An item delegate with a fixed height and faint grey vertical lines
-    between columns"""
-    EXTRA_ROW_HEIGHT = 7
+    """An item delegate with a larger row height and column width, faint grey vertical
+    lines between columns, and a custom editor for handling multi-line data"""
+    MIN_ROW_HEIGHT = 22
+    EXTRA_ROW_HEIGHT = 6
+    EXTRA_COL_WIDTH = 20
 
-    def __init__(self, treeview, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         QtWidgets.QStyledItemDelegate.__init__(self, *args, **kwargs)
         self._pen = QtGui.QPen()
         self._pen.setWidth(1)
         self._pen.setColor(QtGui.QColor.fromRgb(128, 128, 128, 64))
-        fontmetrics = QtGui.QFontMetrics(treeview.font())
-        text_height = fontmetrics.height()
-        self.height = text_height + self.EXTRA_ROW_HEIGHT
 
     def sizeHint(self, *args):
         size = QtWidgets.QStyledItemDelegate.sizeHint(self, *args)
-        return QtCore.QSize(size.width(), self.height)
+        if size.height() <= self.MIN_ROW_HEIGHT:
+            height = self.MIN_ROW_HEIGHT
+        else:
+            # Esnure cells with multiple lines of text still have some padding:
+            height = size.height() + self.EXTRA_ROW_HEIGHT
+        return QtCore.QSize(size.width() + self.EXTRA_COL_WIDTH, height)
 
     def paint(self, painter, option, index):
+        if isinstance(self.parent(), QtWidgets.QTableView):
+            # Disable rendering of selection highlight for TableViews, they handle
+            # it themselves with the background colour data:
+            option.state &= ~(QtWidgets.QStyle.State_Selected)
         QtWidgets.QStyledItemDelegate.paint(self, painter, option, index)
         if index.column() > 0:
             painter.setPen(self._pen)
             painter.drawLine(option.rect.topLeft(), option.rect.bottomLeft())
+
+    def eventFilter(self, obj, event):
+        """Filter events before they get to the editor, so that editing is ended when
+        the user presses tab, shift-tab or enter (which otherwise would not end editing
+        in a QTextEdit)."""
+        if event.type() == QtCore.QEvent.KeyPress:
+            if event.key() in [QtCore.Qt.Key_Enter, QtCore.Qt.Key_Return]:
+                # Allow shift-enter
+                if not event.modifiers() & QtCore.Qt.ShiftModifier:
+                    self.commitData.emit(obj)
+                    self.closeEditor.emit(obj)
+                    return True
+            elif event.key() == QtCore.Qt.Key_Tab:
+                self.commitData.emit(obj)
+                self.closeEditor.emit(obj, QtWidgets.QStyledItemDelegate.EditNextItem)
+                return True
+            elif event.key() == QtCore.Qt.Key_Backtab:
+                self.commitData.emit(obj)
+                self.closeEditor.emit(obj, QtWidgets.QStyledItemDelegate.EditPreviousItem)
+                return True
+        return QtWidgets.QStyledItemDelegate.eventFilter(self, obj, event)
+
+    def createEditor(self, parent, option, index):
+        return Editor(parent)
+
+    def setEditorData(self, editor, index):
+        editor.setPlainText(index.data())
+        font = index.data(QtCore.Qt.FontRole)
+        default_font = qapplication.font(self.parent())
+        if font is None:
+            font = default_font
+        font.setPointSize(default_font.pointSize())
+        editor.setFont(font)
+        font_height = QtGui.QFontMetrics(font).height()
+        padding = (self.MIN_ROW_HEIGHT - font_height) / 2 - 1
+        editor.document().setDocumentMargin(padding)
+        editor.selectAll()
+        
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.toPlainText())
 
 
 class GroupTab(object):
@@ -544,13 +687,11 @@ class GroupTab(object):
     GLOBALS_ROLE_SORT_DATA = QtCore.Qt.UserRole + 2
     GLOBALS_ROLE_PREVIOUS_TEXT = QtCore.Qt.UserRole + 3
     GLOBALS_ROLE_IS_BOOL = QtCore.Qt.UserRole + 4
-    GLOBALS_ROLE_IGNORE_TABNEXT = QtCore.Qt.UserRole + 5
 
-    COLOR_ERROR = '#FF9999'  # light red
-    COLOR_OK = '#AAFFCC'  # light green
-    COLOR_BOOL_ON = '#66FF33'  # bright green
+    COLOR_ERROR = '#F79494'  # light red
+    COLOR_OK = '#A5F7C6'  # light green
+    COLOR_BOOL_ON = '#63F731'  # bright green
     COLOR_BOOL_OFF = '#608060'  # dark green
-    COLOR_NAME = '#EFEFEF'  # light grey
 
     GLOBALS_DUMMY_ROW_TEXT = '<Click to add global>'
 
@@ -559,7 +700,7 @@ class GroupTab(object):
         self.tabWidget = tabWidget
 
         loader = UiLoader()
-        loader.registerCustomWidget(TreeView)
+        loader.registerCustomWidget(TableView)
         self.ui = loader.load('group.ui')
 
         # Add the ui to the parent tabWidget:
@@ -567,25 +708,25 @@ class GroupTab(object):
 
         self.set_file_and_group_name(globals_file, group_name)
 
-        self.globals_model = AlternatingColorModel(treeview=self.ui.treeView_globals)
+        self.globals_model = AlternatingColorModel(view=self.ui.tableView_globals)
         self.globals_model.setHorizontalHeaderLabels(['Delete', 'Name', 'Value', 'Units', 'Expansion'])
         self.globals_model.setSortRole(self.GLOBALS_ROLE_SORT_DATA)
 
-        self.item_delegate = ItemDelegate(self.ui.treeView_globals)
-        for col in range(self.globals_model.columnCount()):
-            self.ui.treeView_globals.setItemDelegateForColumn(col, self.item_delegate)
-
-        self.ui.treeView_globals.setModel(self.globals_model)
-        self.ui.treeView_globals.setRoleIgnoreTabNext(self.GLOBALS_ROLE_IGNORE_TABNEXT)
-        self.ui.treeView_globals.setSelectionMode(QtWidgets.QTreeView.ExtendedSelection)
-        self.ui.treeView_globals.setSortingEnabled(True)
+        self.ui.tableView_globals.setModel(self.globals_model)
+        self.ui.tableView_globals.setSelectionBehavior(QtWidgets.QTableView.SelectRows)
+        self.ui.tableView_globals.setSelectionMode(QtWidgets.QTableView.ExtendedSelection)
+        self.ui.tableView_globals.setSortingEnabled(True)
         # Make it so the user can just start typing on an item to edit:
-        self.ui.treeView_globals.setEditTriggers(QtWidgets.QTreeView.AnyKeyPressed |
-                                                 QtWidgets.QTreeView.EditKeyPressed)
+        self.ui.tableView_globals.setEditTriggers(QtWidgets.QTableView.AnyKeyPressed |
+                                                  QtWidgets.QTableView.EditKeyPressed)
         # Ensure the clickable region of the delete button doesn't extend forever:
-        self.ui.treeView_globals.header().setStretchLastSection(False)
+        self.ui.tableView_globals.horizontalHeader().setStretchLastSection(False)
+        # Stretch the value column to fill available space:
+        self.ui.tableView_globals.horizontalHeader().setSectionResizeMode(
+            self.GLOBALS_COL_VALUE, QtWidgets.QHeaderView.Stretch
+        )
         # Setup stuff for a custom context menu:
-        self.ui.treeView_globals.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.ui.tableView_globals.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         # Make the actions for the context menu:
         self.action_globals_delete_selected = QtWidgets.QAction(
             QtGui.QIcon(':qtutils/fugue/minus'), 'Delete selected global(s)',  self.ui)
@@ -600,20 +741,24 @@ class GroupTab(object):
         self.populate_model()
         # Set sensible column widths:
         for col in range(self.globals_model.columnCount()):
-            self.ui.treeView_globals.resizeColumnToContents(col)
-        if self.ui.treeView_globals.columnWidth(self.GLOBALS_COL_NAME) < 200:
-            self.ui.treeView_globals.setColumnWidth(self.GLOBALS_COL_NAME, 200)
-        if self.ui.treeView_globals.columnWidth(self.GLOBALS_COL_VALUE) < 200:
-            self.ui.treeView_globals.setColumnWidth(self.GLOBALS_COL_VALUE, 200)
-        if self.ui.treeView_globals.columnWidth(self.GLOBALS_COL_UNITS) < 100:
-            self.ui.treeView_globals.setColumnWidth(self.GLOBALS_COL_UNITS, 100)
-        if self.ui.treeView_globals.columnWidth(self.GLOBALS_COL_EXPANSION) < 100:
-            self.ui.treeView_globals.setColumnWidth(self.GLOBALS_COL_EXPANSION, 100)
-        self.ui.treeView_globals.resizeColumnToContents(self.GLOBALS_COL_DELETE)
+            if col != self.GLOBALS_COL_VALUE:
+                self.ui.tableView_globals.resizeColumnToContents(col)
+        if self.ui.tableView_globals.columnWidth(self.GLOBALS_COL_NAME) < 200:
+            self.ui.tableView_globals.setColumnWidth(self.GLOBALS_COL_NAME, 200)
+        if self.ui.tableView_globals.columnWidth(self.GLOBALS_COL_VALUE) < 200:
+            self.ui.tableView_globals.setColumnWidth(self.GLOBALS_COL_VALUE, 200)
+        if self.ui.tableView_globals.columnWidth(self.GLOBALS_COL_UNITS) < 100:
+            self.ui.tableView_globals.setColumnWidth(self.GLOBALS_COL_UNITS, 100)
+        if self.ui.tableView_globals.columnWidth(self.GLOBALS_COL_EXPANSION) < 100:
+            self.ui.tableView_globals.setColumnWidth(self.GLOBALS_COL_EXPANSION, 100)
+        self.ui.tableView_globals.resizeColumnToContents(self.GLOBALS_COL_DELETE)
+
+        # Error state of tab
+        self.tab_contains_errors = False
 
     def connect_signals(self):
-        self.ui.treeView_globals.leftClicked.connect(self.on_treeView_globals_leftClicked)
-        self.ui.treeView_globals.customContextMenuRequested.connect(self.on_treeView_globals_context_menu_requested)
+        self.ui.tableView_globals.leftClicked.connect(self.on_tableView_globals_leftClicked)
+        self.ui.tableView_globals.customContextMenuRequested.connect(self.on_tableView_globals_context_menu_requested)
         self.action_globals_set_selected_true.triggered.connect(
             lambda: self.on_globals_set_selected_bools_triggered('True'))
         self.action_globals_set_selected_false.triggered.connect(
@@ -664,11 +809,11 @@ class GroupTab(object):
         dummy_delete_item.setToolTip('Click to add global')
 
         dummy_name_item = QtGui.QStandardItem(self.GLOBALS_DUMMY_ROW_TEXT)
+        dummy_name_item.setFont(QtGui.QFont("Ubuntu Mono"))
         dummy_name_item.setToolTip('Click to add global')
         dummy_name_item.setData(True, self.GLOBALS_ROLE_IS_DUMMY_ROW)
         dummy_name_item.setData(self.GLOBALS_DUMMY_ROW_TEXT, self.GLOBALS_ROLE_PREVIOUS_TEXT)
         dummy_name_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsEditable)  # Clears the 'selectable' flag
-        dummy_name_item.setBackground(QtGui.QColor(self.COLOR_NAME))
 
         dummy_value_item = QtGui.QStandardItem()
         dummy_value_item.setData(True, self.GLOBALS_ROLE_IS_DUMMY_ROW)
@@ -689,7 +834,7 @@ class GroupTab(object):
             [dummy_delete_item, dummy_name_item, dummy_value_item, dummy_units_item, dummy_expansion_item])
 
         # Sort by name:
-        self.ui.treeView_globals.sortByColumn(self.GLOBALS_COL_NAME, QtCore.Qt.AscendingOrder)
+        self.ui.tableView_globals.sortByColumn(self.GLOBALS_COL_NAME, QtCore.Qt.AscendingOrder)
 
     def make_global_row(self, name, value='', units='', expansion=''):
         logger.debug('%s:%s - make global row: %s ' % (self.globals_file, self.group_name, name))
@@ -708,20 +853,18 @@ class GroupTab(object):
         name_item.setData(name, self.GLOBALS_ROLE_SORT_DATA)
         name_item.setData(name, self.GLOBALS_ROLE_PREVIOUS_TEXT)
         name_item.setToolTip(name)
-        name_item.setBackground(QtGui.QColor(self.COLOR_NAME))
+        name_item.setFont(QtGui.QFont("Ubuntu Mono"))
 
         value_item = QtGui.QStandardItem(value)
         value_item.setData(value, self.GLOBALS_ROLE_SORT_DATA)
         value_item.setData(str(value), self.GLOBALS_ROLE_PREVIOUS_TEXT)
         value_item.setToolTip('Evaluating...')
+        value_item.setFont(QtGui.QFont("Ubuntu Mono"))
 
         units_item = QtGui.QStandardItem(units)
         units_item.setData(units, self.GLOBALS_ROLE_SORT_DATA)
         units_item.setData(units, self.GLOBALS_ROLE_PREVIOUS_TEXT)
         units_item.setData(False, self.GLOBALS_ROLE_IS_BOOL)
-        # Treeview.moveCursor will see this and not go to the expansion item
-        # when tab is pressed after editing:
-        units_item.setData(True, self.GLOBALS_ROLE_IGNORE_TABNEXT)
         units_item.setToolTip('')
 
         expansion_item = QtGui.QStandardItem(expansion)
@@ -732,7 +875,7 @@ class GroupTab(object):
         row = [delete_item, name_item, value_item, units_item, expansion_item]
         return row
 
-    def on_treeView_globals_leftClicked(self, index):
+    def on_tableView_globals_leftClicked(self, index):
         if qapplication.keyboardModifiers() != QtCore.Qt.NoModifier:
             # Only handle mouseclicks with no keyboard modifiers.
             return
@@ -744,8 +887,8 @@ class GroupTab(object):
         if item.data(self.GLOBALS_ROLE_IS_DUMMY_ROW):
             # They clicked on an 'add new global' row. Enter editing mode on
             # the name item so they can enter a name for the new global:
-            self.ui.treeView_globals.setCurrentIndex(name_index)
-            self.ui.treeView_globals.edit(name_index)
+            self.ui.tableView_globals.setCurrentIndex(name_index)
+            self.ui.tableView_globals.edit(name_index)
         elif item.data(self.GLOBALS_ROLE_IS_BOOL):
             # It's a bool indicator. Toggle it
             value_item = self.get_global_item_by_name(global_name, self.GLOBALS_COL_VALUE)
@@ -760,10 +903,10 @@ class GroupTab(object):
             self.delete_global(global_name)
         elif not item.data(self.GLOBALS_ROLE_IS_BOOL):
             # Edit whatever it is:
-            if (self.ui.treeView_globals.currentIndex() != index
-                    or self.ui.treeView_globals.state() != QtWidgets.QTreeView.EditingState):
-                self.ui.treeView_globals.setCurrentIndex(index)
-                self.ui.treeView_globals.edit(index)
+            if (self.ui.tableView_globals.currentIndex() != index
+                    or self.ui.tableView_globals.state() != QtWidgets.QTreeView.EditingState):
+                self.ui.tableView_globals.setCurrentIndex(index)
+                self.ui.tableView_globals.edit(index)
 
     def on_globals_model_item_changed(self, item):
         if item.column() == self.GLOBALS_COL_NAME:
@@ -854,7 +997,7 @@ class GroupTab(object):
         if new_expansion != previous_expansion:
             self.change_global_expansion(global_name, previous_expansion, new_expansion)
 
-    def on_treeView_globals_context_menu_requested(self, point):
+    def on_tableView_globals_context_menu_requested(self, point):
         menu = QtWidgets.QMenu(self.ui)
         menu.addAction(self.action_globals_set_selected_true)
         menu.addAction(self.action_globals_set_selected_false)
@@ -862,7 +1005,7 @@ class GroupTab(object):
         menu.exec_(QtGui.QCursor.pos())
 
     def on_globals_delete_selected_triggered(self):
-        selected_indexes = self.ui.treeView_globals.selectedIndexes()
+        selected_indexes = self.ui.tableView_globals.selectedIndexes()
         selected_items = (self.globals_model.itemFromIndex(index) for index in selected_indexes)
         name_items = [item for item in selected_items if item.column() == self.GLOBALS_COL_NAME]
         # If multiple selected, show 'delete n groups?' message. Otherwise,
@@ -877,7 +1020,7 @@ class GroupTab(object):
             self.delete_global(global_name, confirm=not confirm_multiple)
 
     def on_globals_set_selected_bools_triggered(self, state):
-        selected_indexes = self.ui.treeView_globals.selectedIndexes()
+        selected_indexes = self.ui.tableView_globals.selectedIndexes()
         selected_items = [self.globals_model.itemFromIndex(index) for index in selected_indexes]
         value_items = [item for item in selected_items if item.column() == self.GLOBALS_COL_VALUE]
         units_items = [item for item in selected_items if item.column() == self.GLOBALS_COL_UNITS]
@@ -922,10 +1065,10 @@ class GroupTab(object):
         return item
 
     def do_model_sort(self):
-        header = self.ui.treeView_globals.header()
+        header = self.ui.tableView_globals.horizontalHeader()
         sort_column = header.sortIndicatorSection()
         sort_order = header.sortIndicatorOrder()
-        self.ui.treeView_globals.sortByColumn(sort_column, sort_order)
+        self.ui.tableView_globals.sortByColumn(sort_column, sort_order)
 
     def new_global(self, global_name):
         logger.info('%s:%s - new global: %s', self.globals_file, self.group_name, global_name)
@@ -946,8 +1089,8 @@ class GroupTab(object):
             value_item = self.get_global_item_by_name(global_name, self.GLOBALS_COL_VALUE,
                                                       previous_name=global_name)
             value_item_index = value_item.index()
-            self.ui.treeView_globals.setCurrentIndex(value_item_index)
-            self.ui.treeView_globals.edit(value_item_index)
+            self.ui.tableView_globals.setCurrentIndex(value_item_index)
+            self.ui.tableView_globals.edit(value_item_index)
             self.globals_changed()
         finally:
             # Set the dummy row's text back ready for another group to be created:
@@ -972,19 +1115,23 @@ class GroupTab(object):
             self.globals_changed()
             value_item = self.get_global_item_by_name(new_global_name, self.GLOBALS_COL_VALUE)
             value = value_item.text()
-            if not value:
-                # Go into editing the units item automatically:
+            if not value and self.ui.tableView_globals.state() != QtWidgets.QAbstractItemView.EditingState:
+                # Go into editing the value item automatically if not already in edit mode:
                 value_item_index = value_item.index()
-                self.ui.treeView_globals.setCurrentIndex(value_item_index)
-                self.ui.treeView_globals.edit(value_item_index)
+                self.ui.tableView_globals.setCurrentIndex(value_item_index)
+                self.ui.tableView_globals.edit(value_item_index)
             else:
                 # If this changed the sort order, ensure the item is still visible:
-                scroll_treeview_to_row_if_current(self.ui.treeView_globals, item)
+                scroll_view_to_row_if_current(self.ui.tableView_globals, item)
 
-    def change_global_value(self, global_name, previous_value, new_value):
+    def change_global_value(self, global_name, previous_value, new_value, interactive=True):
         logger.info('%s:%s - change global value: %s = %s -> %s' %
                     (self.globals_file, self.group_name, global_name, previous_value, new_value))
         item = self.get_global_item_by_name(global_name, self.GLOBALS_COL_VALUE)
+        if not interactive:
+            # Value was not set interactively by the user, it is up to us to set it:
+            with self.globals_model_item_changed_disconnected:
+                item.setText(new_value)
         previous_background = item.background()
         previous_icon = item.icon()
         item.setData(new_value, self.GLOBALS_ROLE_PREVIOUS_TEXT)
@@ -992,13 +1139,17 @@ class GroupTab(object):
         item.setData(None, QtCore.Qt.BackgroundRole)
         item.setIcon(QtGui.QIcon(':qtutils/fugue/hourglass'))
         args = global_name, previous_value, new_value, item, previous_background, previous_icon
-        QtCore.QTimer.singleShot(1, lambda: self.complete_change_global_value(*args))
+        if interactive:
+            QtCore.QTimer.singleShot(1, lambda: self.complete_change_global_value(*args))
+        else:
+            self.complete_change_global_value(*args, interactive=False)
 
-    def complete_change_global_value(self, global_name, previous_value, new_value, item, previous_background, previous_icon):
+    def complete_change_global_value(self, global_name, previous_value, new_value, item, previous_background, previous_icon, interactive=True):
         try:
             runmanager.set_value(self.globals_file, self.group_name, global_name, new_value)
         except Exception as e:
-            error_dialog(str(e))
+            if interactive:
+                error_dialog(str(e))
             # Set the item text back to the old name, since the change failed:
             with self.globals_model_item_changed_disconnected:
                 item.setText(previous_value)
@@ -1006,21 +1157,25 @@ class GroupTab(object):
                 item.setData(previous_value, self.GLOBALS_ROLE_SORT_DATA)
                 item.setData(previous_background, QtCore.Qt.BackgroundRole)
                 item.setIcon(previous_icon)
+            if not interactive:
+                raise
         else:
             self.check_for_boolean_values(item)
             self.do_model_sort()
             item.setToolTip('Evaluating...')
             self.globals_changed()
+            if not interactive:
+                return
             units_item = self.get_global_item_by_name(global_name, self.GLOBALS_COL_UNITS)
             units = units_item.text()
-            if not units:
-                # Go into editing the units item automatically:
+            if not units and self.ui.tableView_globals.state() != QtWidgets.QAbstractItemView.EditingState:
+                # Go into editing the units item automatically if not already in edit mode:
                 units_item_index = units_item.index()
-                self.ui.treeView_globals.setCurrentIndex(units_item_index)
-                self.ui.treeView_globals.edit(units_item_index)
+                self.ui.tableView_globals.setCurrentIndex(units_item_index)
+                self.ui.tableView_globals.edit(units_item_index)
             else:
                 # If this changed the sort order, ensure the item is still visible:
-                scroll_treeview_to_row_if_current(self.ui.treeView_globals, item)
+                scroll_view_to_row_if_current(self.ui.tableView_globals, item)
 
     def change_global_units(self, global_name, previous_units, new_units):
         logger.info('%s:%s - change units: %s = %s -> %s' %
@@ -1037,7 +1192,7 @@ class GroupTab(object):
             item.setData(new_units, self.GLOBALS_ROLE_SORT_DATA)
             self.do_model_sort()
             # If this changed the sort order, ensure the item is still visible:
-            scroll_treeview_to_row_if_current(self.ui.treeView_globals, item)
+            scroll_view_to_row_if_current(self.ui.tableView_globals, item)
 
     def change_global_expansion(self, global_name, previous_expansion, new_expansion):
         logger.info('%s:%s - change expansion: %s = %s -> %s' %
@@ -1055,7 +1210,7 @@ class GroupTab(object):
             self.do_model_sort()
             self.globals_changed()
             # If this changed the sort order, ensure the item is still visible:
-            scroll_treeview_to_row_if_current(self.ui.treeView_globals, item)
+            scroll_view_to_row_if_current(self.ui.tableView_globals, item)
 
     def check_for_boolean_values(self, item):
         """Checks if the value is 'True' or 'False'. If either, makes the
@@ -1096,8 +1251,8 @@ class GroupTab(object):
                 # units and go into editing so the user can enter a
                 # new units string:
                 units_item.setText('')
-                self.ui.treeView_globals.setCurrentIndex(units_item.index())
-                self.ui.treeView_globals.edit(units_item.index())
+                self.ui.tableView_globals.setCurrentIndex(units_item.index())
+                self.ui.tableView_globals.edit(units_item.index())
 
     def globals_changed(self):
         """Called whenever something about a global has changed. call
@@ -1123,7 +1278,7 @@ class GroupTab(object):
     def update_parse_indication(self, active_groups, sequence_globals, evaled_globals):
         # Check that we are an active group:
         if self.group_name in active_groups and active_groups[self.group_name] == self.globals_file:
-            tab_contains_errors = False
+            self.tab_contains_errors = False
             # for global_name, value in evaled_globals[self.group_name].items():
             for i in range(self.globals_model.rowCount()):
                 name_item = self.globals_model.item(i, self.GLOBALS_COL_NAME)
@@ -1160,7 +1315,7 @@ class GroupTab(object):
                     value_item.setBackground(QtGui.QBrush(QtGui.QColor(self.COLOR_ERROR)))
                     value_item.setIcon(QtGui.QIcon(':qtutils/fugue/exclamation'))
                     tooltip = '%s: %s' % (value.__class__.__name__, str(value))
-                    tab_contains_errors = True
+                    self.tab_contains_errors = True
                 else:
                     if value_item.background().color().name().lower() != self.COLOR_OK.lower():
                         value_item.setBackground(QtGui.QBrush(QtGui.QColor(self.COLOR_OK)))
@@ -1171,7 +1326,7 @@ class GroupTab(object):
                 if value_item.toolTip() != tooltip:
                     # logger.info('tooltip_changed')
                     value_item.setToolTip(tooltip)
-            if tab_contains_errors:
+            if self.tab_contains_errors:
                 self.set_tab_icon(':qtutils/fugue/exclamation')
             else:
                 self.set_tab_icon(None)
@@ -1294,14 +1449,6 @@ class RunManager(object):
         self.last_selected_shot_output_folder = self.exp_config.get('paths', 'experiment_shot_storage')
         self.shared_drive_prefix = self.exp_config.get('paths', 'shared_drive')
         self.experiment_shot_storage = self.exp_config.get('paths', 'experiment_shot_storage')
-        # What the automatically created output folders should be, as an
-        # argument to time.strftime():
-        try:
-            self.output_folder_format = self.exp_config.get('runmanager', 'output_folder_format')
-            # Better not start with slashes, irrelevant if it ends with them:
-            self.output_folder_format = self.output_folder_format.strip(os.path.sep)
-        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
-            self.output_folder_format = os.path.join('%Y', '%m', '%d')
         # Store the currently open groups as {(globals_filename, group_name): GroupTab}
         self.currently_open_groups = {}
 
@@ -1309,9 +1456,11 @@ class RunManager(object):
         # show their values and any errors in the tabs they came from.
         self.preparse_globals_thread = threading.Thread(target=self.preparse_globals_loop)
         self.preparse_globals_thread.daemon = True
-        # A threading.Event to inform the preparser thread when globals have
-        # changed, and thus need parsing again:
-        self.preparse_globals_required = threading.Event()
+        # A Queue for informing the preparser thread when globals have changed, and thus
+        # need parsing again. It is a queue rather than a threading.Event() so that
+        # callers can call Queue.join() to wait for parsing to complete in a race-free
+        # way
+        self.preparse_globals_required = queue.Queue()
         self.preparse_globals_thread.start()
 
         # A flag telling the compilation thread to abort:
@@ -1323,6 +1472,9 @@ class RunManager(object):
         self.previous_global_hierarchy = {}
         self.previous_expansion_types = {}
         self.previous_expansions = {}
+
+        # The prospective number of shots resulting from compilation
+        self.n_shots = None
 
         # Start the loop that allows compilations to be queued up:
         self.compile_queue = queue.Queue()
@@ -1338,8 +1490,9 @@ class RunManager(object):
 
         # Start a thread to monitor the time of day and create new shot output
         # folders for each day:
-        self.output_folder_update_required = threading.Event()
+        self.previous_default_output_folder = self.get_default_output_folder()
         inthread(self.rollover_shot_output_folder)
+        self.non_default_folder = None
 
         # The data from the last time we saved the configuration, so we can
         # know if something's changed:
@@ -1421,10 +1574,7 @@ class RunManager(object):
         self.groups_model = QtGui.QStandardItemModel()
         self.groups_model.setHorizontalHeaderLabels(['File/group name', 'Active', 'Delete', 'Open/Close'])
         self.groups_model.setSortRole(self.GROUPS_ROLE_SORT_DATA)
-        self.item_delegate = ItemDelegate(self.ui.treeView_groups)
         self.ui.treeView_groups.setModel(self.groups_model)
-        for col in range(self.groups_model.columnCount()):
-            self.ui.treeView_groups.setItemDelegateForColumn(col, self.item_delegate)
         self.ui.treeView_groups.setAnimated(True)  # Pretty
         self.ui.treeView_groups.setSelectionMode(QtWidgets.QTreeView.ExtendedSelection)
         self.ui.treeView_groups.setSortingEnabled(True)
@@ -1437,6 +1587,10 @@ class RunManager(object):
                                                 QtWidgets.QTreeView.SelectedClicked)
         # Ensure the clickable region of the open/close button doesn't extend forever:
         self.ui.treeView_groups.header().setStretchLastSection(False)
+        # Stretch the filpath/groupname column to fill available space:
+        self.ui.treeView_groups.header().setSectionResizeMode(
+            self.GROUPS_COL_NAME, QtWidgets.QHeaderView.Stretch
+        )
         # Shrink columns other than the 'name' column to the size of their headers:
         for column in range(self.groups_model.columnCount()):
             if column != self.GROUPS_COL_NAME:
@@ -1602,8 +1756,8 @@ class RunManager(object):
         self.last_opened_labscript_folder = os.path.dirname(labscript_file)
         # Write the file to the lineEdit:
         self.ui.lineEdit_labscript_file.setText(labscript_file)
-        # Tell the output folder thread that the output folder might need updating:
-        self.output_folder_update_required.set()
+        # Check if the output folder needs to be updated:
+        self.check_output_folder_update()
 
     def on_edit_labscript_file_clicked(self, checked):
         # get path to text editor
@@ -1644,22 +1798,15 @@ class RunManager(object):
         self.last_selected_shot_output_folder = os.path.dirname(shot_output_folder)
         # Write the file to the lineEdit:
         self.ui.lineEdit_shot_output_folder.setText(shot_output_folder)
-        # Tell the output folder rollover thread to run an iteration, so that
-        # it notices this change (even though it won't do anything now - this
-        # is so it can respond correctly if anything else interesting happens
-        # within the next second):
-        self.output_folder_update_required.set()
+        # Update our knowledge about whether this is the default output folder or not:
+        self.check_output_folder_update()
 
     def on_reset_shot_output_folder_clicked(self, checked):
         current_default_output_folder = self.get_default_output_folder()
         if current_default_output_folder is None:
             return
         self.ui.lineEdit_shot_output_folder.setText(current_default_output_folder)
-        # Tell the output folder rollover thread to run an iteration, so that
-        # it notices this change (even though it won't do anything now - this
-        # is so it can respond correctly if anything else interesting happens
-        # within the next second):
-        self.output_folder_update_required.set()
+        self.check_output_folder_update()
 
     def on_labscript_file_text_changed(self, text):
         # Blank out the 'edit labscript file' button if no labscript file is
@@ -1675,10 +1822,11 @@ class RunManager(object):
         # Blank out the 'reset default output folder' button if the user is
         # already using the default output folder
         if text == self.get_default_output_folder():
-            enabled = False
+            self.non_default_folder = False
         else:
-            enabled = True
-        self.ui.toolButton_reset_shot_output_folder.setEnabled(enabled)
+            self.non_default_folder = True
+        self.ui.toolButton_reset_shot_output_folder.setEnabled(self.non_default_folder)
+        self.ui.label_non_default_folder.setVisible(self.non_default_folder)
         self.ui.lineEdit_shot_output_folder.setToolTip(text)
 
     def on_engage_clicked(self):
@@ -1980,17 +2128,12 @@ class RunManager(object):
         name_items = [item for item in selected_items
                       if item.column() == self.GROUPS_COL_NAME
                       and item.parent() is not None]
-        # Make things a bit faster by acquiring network only locks on all the
-        # files we're dealing with.  That way all the open and close
-        # operations will be faster.
         filenames = set(item.parent().text() for item in name_items)
-        file_locks = [labscript_utils.h5_lock.NetworkOnlyLock(filename) for filename in filenames]
-        with nested(*file_locks):
-            for item in name_items:
-                globals_file = item.parent().text()
-                group_name = item.text()
-                if (globals_file, group_name) not in self.currently_open_groups:
-                    self.open_group(globals_file, group_name, trigger_preparse=False)
+        for item in name_items:
+            globals_file = item.parent().text()
+            group_name = item.text()
+            if (globals_file, group_name) not in self.currently_open_groups:
+                self.open_group(globals_file, group_name, trigger_preparse=False)
         if name_items:
             self.globals_changed()
 
@@ -2146,7 +2289,7 @@ class RunManager(object):
             else:
                 raise AssertionError('Invalid Check state')
             # If this changed the sort order, ensure the item is still visible:
-            scroll_treeview_to_row_if_current(self.ui.treeView_groups, item)
+            scroll_view_to_row_if_current(self.ui.treeView_groups, item)
         elif parent_item is None:
             # They clicked on a globals file row.
             globals_file = name_item.text()
@@ -2318,7 +2461,7 @@ class RunManager(object):
                 item.setToolTip('Load globals group into runmanager.')
             self.do_model_sort()
             # If this changed the sort order, ensure the item is still visible:
-            scroll_treeview_to_row_if_current(self.ui.treeView_groups, item)
+            scroll_view_to_row_if_current(self.ui.treeView_groups, item)
 
     @inmain_decorator()
     def get_default_output_folder(self):
@@ -2326,32 +2469,34 @@ class RunManager(object):
         the current date and selected labscript file. Returns empty string if
         no labscript file is selected. Does not create the default output
         folder, does not check if it exists."""
-        current_day_folder_suffix = time.strftime(self.output_folder_format)
         current_labscript_file = self.ui.lineEdit_labscript_file.text()
         if not current_labscript_file:
             return ''
-        current_labscript_basename = os.path.splitext(os.path.basename(current_labscript_file))[0]
-        default_output_folder = os.path.join(self.experiment_shot_storage,
-                                             current_labscript_basename, current_day_folder_suffix)
+        _, default_output_folder, _ = runmanager.new_sequence_details(
+            current_labscript_file,
+            config=self.exp_config,
+            increment_sequence_index=False,
+        )
         default_output_folder = os.path.normpath(default_output_folder)
         return default_output_folder
 
     def rollover_shot_output_folder(self):
-        """Runs in a thread, checking once a second if it is a new day or the
-        labscript file has changed. If it is or has, sets the default folder
-        in which compiled shots will be put. Does not create the folder if it
-        does not already exists, this will be done at compile-time. Will run
-        immediately without waiting a full second if the threading.Event
-        self.output_folder_update_required is set() from anywhere."""
-        previous_default_output_folder = self.get_default_output_folder()
+        """Runs in a thread, checking every 30 seconds if the default output folder has
+        changed, likely because the date has changed, but also possible because another
+        instance of runmanager has incremented the sequence index. If the defaulr output
+        folder has changed, and if runmanager is configured to use the default output
+        folder, sets the folder in which compiled shots will be put. Does not create the
+        folder if it does not already exist, this will be done at compile-time."""
         while True:
-            # Wait up to one second, shorter if the Event() gets set() by someone:
-            self.output_folder_update_required.wait(1)
-            self.output_folder_update_required.clear()
-            previous_default_output_folder = self.check_output_folder_update(previous_default_output_folder)
+            time.sleep(30)
+            try:
+                self.check_output_folder_update()
+            except Exception as e:
+                # Don't stop the thread.
+                logger.exception("error checking default output folder")
 
     @inmain_decorator()
-    def check_output_folder_update(self, previous_default_output_folder):
+    def check_output_folder_update(self):
         """Do a single check of whether the output folder needs updating. This
         is implemented as a separate function to the above loop so that the
         whole check happens at once in the Qt main thread and hence is atomic
@@ -2359,24 +2504,22 @@ class RunManager(object):
         current_default_output_folder = self.get_default_output_folder()
         if current_default_output_folder is None:
             # No labscript file selected:
-            return previous_default_output_folder
+            return
         currently_selected_output_folder = self.ui.lineEdit_shot_output_folder.text()
-        if current_default_output_folder != previous_default_output_folder:
+        if current_default_output_folder != self.previous_default_output_folder:
             # It's a new day, or a new labscript file.
             # Is the user using default folders?
-            if currently_selected_output_folder == previous_default_output_folder:
+            if currently_selected_output_folder == self.previous_default_output_folder:
                 # Yes they are. In that case, update to use the new folder:
                 self.ui.lineEdit_shot_output_folder.setText(current_default_output_folder)
-            return current_default_output_folder
-        return previous_default_output_folder
+            self.previous_default_output_folder = current_default_output_folder
 
     @inmain_decorator()
     def globals_changed(self):
-        """Called from either self or a GroupTab to inform runmanager that
-        something about globals has changed, and that they need parsing
-        again"""
+        """Called from either self, a GroupTab, or the RemoteServer to inform runmanager
+        that something about globals has changed, and that they need parsing again."""
         self.ui.pushButton_engage.setEnabled(False)
-        QtCore.QTimer.singleShot(1,self.preparse_globals_required.set)
+        self.preparse_globals_required.put(None)
 
     def update_axes_indentation(self):
         for i in range(self.axes_model.rowCount()):
@@ -2474,7 +2617,7 @@ class RunManager(object):
         while True:
             results = self.parse_globals(active_groups, raise_exceptions=False, expand_globals=False, return_dimensions = True)
             sequence_globals, shots, evaled_globals, global_hierarchy, expansions, dimensions = results
-            n_shots = len(shots)
+            self.n_shots = len(shots)
             expansions_changed = self.guess_expansion_modes(
                 active_groups, evaled_globals, global_hierarchy, expansions)
             if not expansions_changed:
@@ -2483,11 +2626,10 @@ class RunManager(object):
                 # when changing a zip group from a list to a single value
                 results = self.parse_globals(active_groups, raise_exceptions=False, expand_globals=True, return_dimensions = True)
                 sequence_globals, shots, evaled_globals, global_hierarchy, expansions, dimensions = results
-                n_shots = len(shots)
+                self.n_shots = len(shots)
                 break
-        self.update_tabs_parsing_indication(active_groups, sequence_globals, evaled_globals, n_shots)
+        self.update_tabs_parsing_indication(active_groups, sequence_globals, evaled_globals, self.n_shots)
         self.update_axes_tab(expansions, dimensions)
-
 
     def preparse_globals_loop(self):
         """Runs in a thread, waiting on a threading.Event that tells us when
@@ -2497,16 +2639,35 @@ class RunManager(object):
         while True:
             try:
                 # Wait until we're needed:
-                self.preparse_globals_required.wait()
-                self.preparse_globals_required.clear()
+                self.preparse_globals_required.get()
+                n_requests = 1
+                # Wait until the main thread is idle before clearing the queue of
+                # requests. This way if preparsing is triggered multiple times within
+                # the main thread before it becomes idle, we can respond to this all at
+                # once, once they are all done, rather than starting too early and
+                # having to preparse again.
+                with qtlock:
+                    while True:
+                        try:
+                            self.preparse_globals_required.get(block=False)
+                            n_requests += 1
+                        except queue.Empty:
+                            break
                 # Do some work:
                 self.preparse_globals()
+                # Tell any callers calling preparse_globals_required.join() that we are
+                # done with their request:
+                for _ in range(n_requests):
+                    self.preparse_globals_required.task_done()
             except Exception:
                 # Raise the error, but keep going so we don't take down the
                 # whole thread if there is a bug.
                 exc_info = sys.exc_info()
                 raise_exception_in_thread(exc_info)
-                continue
+
+    def wait_until_preparse_complete(self):
+        """Block until the preparse loop has finished pending work"""
+        self.preparse_globals_required.join()
 
     def get_group_item_by_name(self, globals_file, group_name, column, previous_name=None):
         """Returns an item from the row representing a globals group in the
@@ -2549,11 +2710,11 @@ class RunManager(object):
         self.ui.treeView_groups.sortByColumn(sort_column, sort_order)
 
     @inmain_decorator()  # Can be called from a non-main thread
-    def get_active_groups(self):
+    def get_active_groups(self, interactive=True):
         """Returns active groups in the format {group_name: globals_file}.
         Displays an error dialog and returns None if multiple groups of the
         same name are selected, this is invalid - selected groups must be
-        uniquely named."""
+        uniquely named. If interactive=False, raises the exception instead."""
         active_groups = {}
         for i in range(self.groups_model.rowCount()):
             file_name_item = self.groups_model.item(i, self.GROUPS_COL_NAME)
@@ -2564,9 +2725,14 @@ class RunManager(object):
                     group_name = group_name_item.text()
                     globals_file = file_name_item.text()
                     if group_name in active_groups:
-                        error_dialog('There are two active groups named %s. ' % group_name +
-                                     'Active groups must have unique names to be used together.')
-                        return
+                        msg = (
+                            'There are two active groups named %s. ' % group_name
+                            + 'Active groups must have unique names.'
+                        )
+                        if interactive:
+                            error_dialog(msg)
+                            return
+                        raise RuntimeError(msg)
                     active_groups[group_name] = globals_file
         return active_groups
 
@@ -2640,7 +2806,7 @@ class RunManager(object):
         self.globals_changed()
         self.do_model_sort()
         # If this changed the sort order, ensure the file item is visible:
-        scroll_treeview_to_row_if_current(self.ui.treeView_groups, file_name_item)
+        scroll_view_to_row_if_current(self.ui.treeView_groups, file_name_item)
 
     def make_group_row(self, group_name):
         """Returns a new row representing one group in the groups tab, ready to be
@@ -2739,7 +2905,7 @@ class RunManager(object):
                 self.delete_group(source_globals_file, source_group_name, confirm=False)
 
             # If this changed the sort order, ensure the group item is still visible:
-            scroll_treeview_to_row_if_current(self.ui.treeView_groups, name_item)
+            scroll_view_to_row_if_current(self.ui.treeView_groups, name_item)
 
     def new_group(self, globals_file, group_name):
         item = self.get_group_item_by_name(globals_file, group_name, self.GROUPS_COL_NAME,
@@ -2764,7 +2930,7 @@ class RunManager(object):
             self.globals_changed()
             self.ui.treeView_groups.setCurrentIndex(name_item.index())
             # If this changed the sort order, ensure the group item is still visible:
-            scroll_treeview_to_row_if_current(self.ui.treeView_groups, name_item)
+            scroll_view_to_row_if_current(self.ui.treeView_groups, name_item)
         finally:
             # Set the dummy row's text back ready for another group to be created:
             item.setText(self.GROUPS_DUMMY_ROW_TEXT)
@@ -2800,7 +2966,7 @@ class RunManager(object):
             item.setData(new_group_name, self.GROUPS_ROLE_SORT_DATA)
             self.do_model_sort()
             # If this changed the sort order, ensure the group item is still visible:
-            scroll_treeview_to_row_if_current(self.ui.treeView_groups, item)
+            scroll_view_to_row_if_current(self.ui.treeView_groups, item)
             group_tab = self.currently_open_groups.pop((globals_file, previous_group_name), None)
             if group_tab is not None:
                 # Change labels and tooltips appropriately if the group is open:
@@ -2981,7 +3147,6 @@ class RunManager(object):
             self.close_globals_file(globals_file, confirm=False)
         # Ensure folder exists, if this was opened programmatically we are
         # creating the file, so the directory had better exist!
-        mkdir_p(os.path.dirname(filename))
         runmanager_config = LabConfig(filename)
 
         has_been_a_warning = [False]
@@ -3339,9 +3504,24 @@ class RunManager(object):
         return expansion_types_changed
 
     def make_h5_files(self, labscript_file, output_folder, sequence_globals, shots, shuffle):
-        mkdir_p(output_folder)  # ensure it exists
-        sequence_id = runmanager.generate_sequence_id(labscript_file)
-        run_files = runmanager.make_run_files(output_folder, sequence_globals, shots, sequence_id, shuffle)
+        sequence_attrs, default_output_dir, filename_prefix = runmanager.new_sequence_details(
+            labscript_file, config=self.exp_config, increment_sequence_index=True
+        )
+        if output_folder == self.previous_default_output_folder:
+            # The user is using dthe efault output folder. Just in case the sequence
+            # index has been updated or the date has changed, use the default_output dir
+            # obtained from new_sequence_details, as it is race-free, whereas the one
+            # from the UI may be out of date since we only update it once a second.
+            output_folder = default_output_dir
+        self.check_output_folder_update()
+        run_files = runmanager.make_run_files(
+            output_folder,
+            sequence_globals,
+            shots,
+            sequence_attrs,
+            filename_prefix,
+            shuffle,
+        )
         logger.debug(run_files)
         return labscript_file, run_files
 
@@ -3395,6 +3575,188 @@ class RunManager(object):
         except Exception as e:
             self.output_box.output('Couldn\'t submit shot to runviewer: %s\n\n' % str(e), red=True)
 
+
+class RemoteServer(ZMQServer):
+    def __init__(self):
+        port = app.exp_config.getint(
+            'ports', 'runmanager', fallback=runmanager.remote.DEFAULT_PORT
+        )
+        ZMQServer.__init__(self, port=port)
+
+    def handle_get_globals(self, raw=False):
+        active_groups = inmain(app.get_active_groups, interactive=False)
+        sequence_globals = runmanager.get_globals(active_groups)
+        all_globals = {}
+        if raw:
+            for group_globals in sequence_globals.values():
+                values_only = {name: val for name, (val, _, _) in group_globals.items()}
+                all_globals.update(values_only)
+        else:
+            evaled_globals, global_hierarchy, expansions = runmanager.evaluate_globals(
+                sequence_globals, raise_exceptions=False
+            )
+            for group_globals in evaled_globals.values():
+                all_globals.update(group_globals)
+        return all_globals
+
+    @inmain_decorator()
+    def handle_set_globals(self, globals, raw=False):
+        active_groups = app.get_active_groups(interactive=False)
+        sequence_globals = runmanager.get_globals(active_groups)
+        try:
+            for global_name, new_value in globals.items():
+                # Unless raw=True, convert to str representation for saving to the GUI
+                # or file. If this does not result in an object the user can actually
+                # use, evaluation will error and the caller will find out about it later
+                if not raw:
+                    new_value = repr(new_value)
+                elif not isinstance(new_value, (str, bytes)):
+                    msg = "global %s must be a string if raw=True, not %s"
+                    raise TypeError(msg % (global_name, new_value.__class__.__name__))
+
+                # Find the group this global is in:
+                for group_name, group_globals in sequence_globals.items():
+                    globals_file = active_groups[group_name]
+                    if global_name in group_globals:
+                        # Confirm it's not also in another group:
+                        for other_name, other_globals in sequence_globals.items():
+                            if other_globals is not group_globals:
+                                if global_name in other_globals:
+                                    msg = """Cannot set global %s, it is defined in
+                                        multiple active groups: %s and %s"""
+                                    msg = msg % (global_name, group_name, other_name)
+                                    raise RuntimeError(dedent(msg))
+                        previous_value, _, _ = sequence_globals[group_name][global_name]
+
+                        # Append expression-final comments in the previous expression to
+                        # the new one:
+                        comments = runmanager.find_comments(previous_value)
+                        if comments:
+                            # Only the final comment
+                            comment_start, comment_end = comments[-1]
+                            # Only if the comment is the last thing in the expression:
+                            if comment_end == len(previous_value):
+                                new_value += previous_value[comment_start:comment_end]
+                        try:
+                            # Is the group open?
+                            group_tab = app.currently_open_groups[
+                                globals_file, group_name
+                            ]
+                        except KeyError:
+                            # Group is not open. Change the global value on disk:
+                            runmanager.set_value(
+                                globals_file, group_name, global_name, new_value
+                            )
+                        else:
+                            # Group is open. Change the global value via the GUI:
+                            group_tab.change_global_value(
+                                global_name,
+                                previous_value,
+                                new_value,
+                                interactive=False,
+                            )
+                        break
+                else:
+                    # Global was not found.
+                    msg = "Global %s not found in any active group" % global_name
+                    raise ValueError(msg)
+        finally:
+            # Trigger preparsing of globals to occur so that changes in globals not in
+            # open tabs are reflected in the GUI, such as n_shots, errors on other
+            # globals that depend on them, etc.
+            app.globals_changed()
+
+    def handle_engage(self):
+        app.wait_until_preparse_complete()
+        inmain(app.on_engage_clicked)
+
+    @inmain_decorator()
+    def handle_abort(self):
+        app.on_abort_clicked()
+
+    @inmain_decorator()
+    def handle_get_run_shots(self):
+        return app.ui.checkBox_run_shots.isChecked()
+
+    @inmain_decorator()
+    def handle_set_run_shots(self, value):
+        app.ui.checkBox_run_shots.setChecked(value)
+
+    @inmain_decorator()
+    def handle_get_view_shots(self):
+        return app.ui.checkBox_view_shots.isChecked()
+
+    @inmain_decorator()
+    def handle_set_view_shots(self, value):
+        app.ui.checkBox_view_shots.setChecked(value)
+
+    @inmain_decorator()
+    def handle_get_shuffle(self):
+        return app.ui.pushButton_shuffle.isChecked()
+
+    @inmain_decorator()
+    def handle_set_shuffle(self, value):
+        app.ui.pushButton_shuffle.setChecked(value)
+
+    def handle_n_shots(self):
+        # Wait until any current preparsing is done, to ensure this is not racy w.r.t
+        # previous remote calls:
+        app.wait_until_preparse_complete()
+        return app.n_shots
+
+    @inmain_decorator()
+    def handle_get_labscript_file(self):
+        labscript_file = app.ui.lineEdit_labscript_file.text()
+        return os.path.abspath(labscript_file)
+
+    @inmain_decorator()
+    def handle_set_labscript_file(self, value):
+        labscript_file = os.path.abspath(value)
+        app.ui.lineEdit_labscript_file.setText(labscript_file)
+
+    @inmain_decorator()
+    def handle_get_shot_output_folder(self):
+        shot_output_folder = app.ui.lineEdit_shot_output_folder.text()
+        return os.path.abspath(shot_output_folder)
+
+    @inmain_decorator()
+    def handle_set_shot_output_folder(self, value):
+        shot_output_folder = os.path.abspath(value)
+        app.ui.lineEdit_shot_output_folder.setText(shot_output_folder)
+
+    def handle_error_in_globals(self):
+        try:
+            # This will raise an exception if there are multiple active groups of the
+            # same name:
+            active_groups = inmain(app.get_active_groups, interactive=False)
+            sequence_globals = runmanager.get_globals(active_groups)
+            # This will raise an exception if any of the globals can't be evaluated:
+            runmanager.evaluate_globals(sequence_globals, raise_exceptions=True)
+        except Exception:
+            return True
+        return False
+
+    def handle_is_output_folder_default(self):
+        return not app.non_default_folder
+
+    @inmain_decorator()
+    def handle_reset_shot_output_folder(self):
+        app.on_reset_shot_output_folder_clicked(None)
+
+    def handler(self, request_data):
+        cmd, args, kwargs = request_data
+        if cmd == 'hello':
+            return 'hello'
+        elif cmd == '__version__':
+            return runmanager.__version__
+        try:
+            return getattr(self, 'handle_' + cmd)(*args, **kwargs)
+        except Exception as e:
+            msg = traceback.format_exc()
+            msg = "Runmanager server returned an exception:\n" + msg
+            return e.__class__(msg)
+
+
 if __name__ == "__main__":
     logger = setup_logging('runmanager')
     labscript_utils.excepthook.set_logger(logger)
@@ -3402,5 +3764,8 @@ if __name__ == "__main__":
     qapplication = QtWidgets.QApplication(sys.argv)
     qapplication.setAttribute(QtCore.Qt.AA_DontShowIconsInMenus, False)
     app = RunManager()
+    splash.update_text('Starting remote server')
+    remote_server = RemoteServer()
     splash.hide()
-    sys.exit(qapplication.exec_())
+    qapplication.exec_()
+    remote_server.shutdown()
