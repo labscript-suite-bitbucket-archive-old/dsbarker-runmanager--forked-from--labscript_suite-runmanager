@@ -30,16 +30,25 @@ import subprocess
 import types
 import threading
 import traceback
+import datetime
+import errno
+import json
+import tokenize
+if PY2:
+    import StringIO as io
+else:
+    import io
 
 import labscript_utils.h5_lock
 import h5py
 import numpy as np
 
-check_version('labscript_utils', '2.11.0', '3')
+check_version('labscript_utils', '2.12.5', '3')
 from labscript_utils.ls_zprocess import ProcessTree, zmq_push_multipart
+from labscript_utils.labconfig import LabConfig
 process_tree = ProcessTree.instance()
 
-__version__ = '2.2.0'
+__version__ = '2.5.0'
 
 
 def _ensure_str(s):
@@ -47,19 +56,37 @@ def _ensure_str(s):
     return s.decode() if isinstance(s, bytes) else str(s)
 
 
+def mkdir_p(path):
+    try:
+        os.makedirs(path)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST and os.path.isdir(path):
+            pass
+        else:
+            raise
+
+            
 def is_valid_python_identifier(name):
     import tokenize
     if PY2:
         import StringIO as io
     else:
         import io
+    # No whitespace allowed. Do this check here because an actual newline in the source
+    # is not easily distinguished from a NEWLINE token in the produced tokens, which is
+    # produced even when there is no newline character in the string. So since we ignore
+    # NEWLINE later, we must check for it now.
+    if name != "".join(name.split()):
+        return False
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(name).readline))
     except tokenize.TokenError:
         return False
-    if len(tokens) == 2:
-        (token_type, _, _, _, _), _ = tokens
-        return token_type == tokenize.NAME
+    token_types = [
+        t[0] for t in tokens if t[0] not in [tokenize.NEWLINE, tokenize.ENDMARKER]
+    ]
+    if len(token_types) == 1:
+        return token_types[0] == tokenize.NAME
     return False
 
 
@@ -519,6 +546,8 @@ def expand_globals(sequence_globals, evaled_globals, expansion_config = None, re
         for global_name in expansions:
             if expansions[global_name] == zip_key:
                 value = values[global_name]
+                if isinstance(value, Exception):
+                    continue
                 if not zip_key:
                     # Wrap up non-iterating globals (with zip_key = '') in a
                     # one-element list. When zipped and then outer product'ed,
@@ -538,6 +567,8 @@ def expand_globals(sequence_globals, evaled_globals, expansion_config = None, re
     for global_name in expansions:
         if expansions[global_name] == 'outer':
             value = values[global_name]
+            if isinstance(value, Exception):
+                continue
             axis = [value]
             axis = list(zip(*axis))
             dimensions['outer '+global_name] = len(axis)
@@ -580,52 +611,149 @@ def expand_globals(sequence_globals, evaled_globals, expansion_config = None, re
     else:
         return shots
 
-def generate_sequence_id(scriptname):
-    """Our convention for generating sequence ids. Just a timestamp and
-    the name of the labscript that the run file is to be compiled with."""
-    timestamp = time.strftime('%Y%m%dT%H%M%S', time.localtime())
-    scriptbase = os.path.basename(scriptname).split('.py')[0]
-    return timestamp + '_' + scriptbase
+def next_sequence_index(shot_basedir, dt, increment=True):
+    """Return the next sequence index for sequences in the given base directory (i.e.
+    <experiment_shot_storage>/<script_basename>) and the date of the given datetime
+    object, and increment the sequence index atomically on disk if increment=True. If
+    not setting increment=True, then the result is indicative only and may be used by
+    other code at any time. One must increment the sequence index prior to use."""
+    from labscript_utils.ls_zprocess import Lock
+    from labscript_utils.shared_drive import path_to_agnostic
+
+    DATE_FORMAT = '%Y-%m-%d'
+    # The file where we store the next sequence index on disk:
+    sequence_index_file = os.path.join(shot_basedir, '.next_sequence_index')
+    # Open with zlock to prevent race conditions with other code:
+    with Lock(path_to_agnostic(sequence_index_file), read_only=not increment):
+        try:
+            with open(sequence_index_file) as f:
+                datestr, sequence_index = json.load(f)
+                if datestr != dt.strftime(DATE_FORMAT):
+                    # New day, start from zero again:
+                    sequence_index = 0
+        except (OSError, IOError) as exc:
+            if exc.errno != errno.ENOENT:
+                raise
+            # File doesn't exist yet, start from zero
+            sequence_index = 0
+        if increment:
+            # Write the new file with the incremented sequence index
+            mkdir_p(os.path.dirname(sequence_index_file))
+            with open(sequence_index_file, 'w') as f:
+                json.dump([dt.strftime(DATE_FORMAT), sequence_index + 1], f)
+        return sequence_index
 
 
-def make_run_files(output_folder, sequence_globals, shots, sequence_id, shuffle=False):
-    """Does what it says. sequence_globals and shots are of the datatypes
-    returned by get_globals and get_shots, one is a nested dictionary with
-    string values, and the other a flat dictionary. sequence_id should
-    be some identifier unique to this sequence, use generate_sequence_id
-    to follow convention. shuffle will randomise the order that the run
-    files are generated in with respect to which element of shots they
-    come from. This function returns a *generator*. The run files are
-    not actually created until you loop over this generator (which gives
-    you the filepaths). This is useful for not having to clean up as many
-    unused files in the event of failed compilation of labscripts. If you
-    want all the run files to be created at some point, simply convert
-    the returned generator to a list. The filenames the run files are
-    given is simply the sequence_id with increasing integers appended."""
-    basename = os.path.join(output_folder, sequence_id)
+def new_sequence_details(script_path, config=None, increment_sequence_index=True):
+    """Generate the details for a new sequence: the toplevel attrs sequence_date,
+    sequence_index, sequence_id; and the the output directory and filename prefix for
+    the shot files, according to labconfig settings. If increment_sequence_index=True,
+    then we are claiming the resulting sequence index for use such that it cannot be
+    used by anyone else. This should be done if the sequence details are immediately
+    about to be used to compile a sequence. Otherwise, set increment_sequence_index to
+    False, but in that case the results are indicative only and one should call this
+    function again with increment_sequence_index=True before compiling the sequence, as
+    otherwise the sequence_index may be used by other code in the meantime."""
+    if config is None:
+        config = LabConfig()
+    script_basename = os.path.splitext(os.path.basename(script_path))[0]
+    shot_storage = config.get('DEFAULT', 'experiment_shot_storage')
+    shot_basedir = os.path.join(shot_storage, script_basename)
+    now = datetime.datetime.now()
+    sequence_timestamp = now.strftime('%Y%m%dT%H%M%S')
+
+    # Toplevel attributes to be saved to the shot files:
+    sequence_date = now.strftime('%Y-%m-%d')
+    sequence_id = sequence_timestamp + '_' + script_basename
+    sequence_index = next_sequence_index(shot_basedir, now, increment_sequence_index)
+
+    sequence_attrs = {
+        'script_basename': script_basename,
+        'sequence_date': sequence_date,
+        'sequence_index': sequence_index,
+        'sequence_id': sequence_id,
+    }
+
+    # Compute the output directory based on labconfig settings:
+    try:
+        subdir_format = config.get('runmanager', 'output_folder_format')
+    except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+        subdir_format = os.path.join('%Y', '%m', '%d', '{sequence_index:05d}')
+
+    # Format the output directory according to the current timestamp, sequence index and
+    # sequence_timestamp, if present in the format string:
+    subdir = now.strftime(subdir_format).format(
+        sequence_index=sequence_index, sequence_timestamp=sequence_timestamp
+    )
+    shot_output_dir = os.path.join(shot_basedir, subdir)
+
+    # Compute the shot filename prefix according to labconfig settings:
+    try:
+        filename_prefix_format = config.get('runmanager', 'filename_prefix_format')
+    except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+        # Default, for backward compatibility:
+        filename_prefix_format = '{sequence_timestamp}_{script_basename}'
+    # Format the filename prefix according to the current timestamp, sequence index,
+    # sequence_timestamp, and script_basename, if present in the format string:
+    filename_prefix = now.strftime(filename_prefix_format).format(
+        sequence_index=sequence_index,
+        sequence_timestamp=sequence_timestamp,
+        script_basename=script_basename,
+    )
+
+    return sequence_attrs, shot_output_dir, filename_prefix
+
+
+def make_run_files(
+    output_folder,
+    sequence_globals,
+    shots,
+    sequence_attrs,
+    filename_prefix,
+    shuffle=False,
+):
+    """Does what it says. sequence_globals and shots are of the datatypes returned by
+    get_globals and get_shots, one is a nested dictionary with string values, and the
+    other a flat dictionary. sequence_attrs is a dict of the attributes pertaining to
+    this sequence to be initially set at the top-level group of the h5 file, as returned
+    by new_sequence_details. output_folder and filename_prefix determine the directory
+    shot files will be output to, as well as their filenames (this function will
+    generate filenames with the shot number and .h5 extension appended to
+    filename_prefix). Sensible defaults for these are also returned by
+    new_sequence_details(), so preferably these should be used.
+
+    Shuffle will randomise the order that the run files are generated in with respect to
+    which element of shots they come from. This function returns a *generator*. The run
+    files are not actually created until you loop over this generator (which gives you
+    the filepaths). This is useful for not having to clean up as many unused files in
+    the event of failed compilation of labscripts. If you want all the run files to be
+    created at some point, simply convert the returned generator to a list. The
+    filenames the run files are given is simply the sequence_id with increasing integers
+    appended."""
+    basename = os.path.join(output_folder, filename_prefix)
     nruns = len(shots)
     ndigits = int(np.ceil(np.log10(nruns)))
     if shuffle:
         random.shuffle(shots)
     for i, shot_globals in enumerate(shots):
         runfilename = ('%s_%0' + str(ndigits) + 'd.h5') % (basename, i)
-        make_single_run_file(runfilename, sequence_globals, shot_globals, sequence_id, i, nruns)
+        make_single_run_file(
+            runfilename, sequence_globals, shot_globals, sequence_attrs, i, nruns
+        )
         yield runfilename
 
 
-def make_single_run_file(filename, sequenceglobals, runglobals, sequence_id, run_no, n_runs):
-    """Does what it says. runglobals is a dict of this run's globals,
-    the format being the same as that of one element of the list returned
-    by expand_globals.  sequence_globals is a nested dictionary of the
-    type returned by get_globals. Every run file needs a sequence ID,
-    generate one with generate_sequence_id. This doesn't have to match
-    the filename of the run file you end up using, though is usually does
-    (exceptions being things like connection tables). run_no and n_runs
-    must be provided, if this run file is part of a sequence, then they
-    should reflect how many run files are being generated which share
-    this sequence_id."""
+def make_single_run_file(filename, sequenceglobals, runglobals, sequence_attrs, run_no, n_runs):
+    """Does what it says. runglobals is a dict of this run's globals, the format being
+    the same as that of one element of the list returned by expand_globals.
+    sequence_globals is a nested dictionary of the type returned by get_globals.
+    sequence_attrs is a dict of attributes pertaining to this sequence, as returned by
+    new_sequence_details. run_no and n_runs must be provided, if this run file is part
+    of a sequence, then they should reflect how many run files are being generated in
+    this sequence, all of which must have identical sequence_attrs."""
+    mkdir_p(os.path.dirname(filename))
     with h5py.File(filename, 'w') as f:
-        f.attrs['sequence_id'] = sequence_id
+        f.attrs.update(sequence_attrs)
         f.attrs['run number'] = run_no
         f.attrs['n_runs'] = n_runs
         f.create_group('globals')
@@ -652,9 +780,9 @@ def make_single_run_file(filename, sequenceglobals, runglobals, sequence_id, run
                 raise ValueError(message)
 
 
-def make_run_file_from_globals_files(labscript_file, globals_files, output_path):
-    """Creates a run file output_path, using all the globals from
-    globals_files. Uses labscript_file only to generate a sequence ID"""
+def make_run_file_from_globals_files(labscript_file, globals_files, output_path, config=None):
+    """Creates a run file output_path, using all the globals from globals_files. Uses
+    labscript_file to determine the sequence_attrs only"""
     groups = get_all_groups(globals_files)
     sequence_globals = get_globals(groups)
     evaled_globals, global_hierarchy, expansions = evaluate_globals(sequence_globals)
@@ -666,8 +794,11 @@ def make_run_file_from_globals_files(labscript_file, globals_files, output_path)
                 scanning_globals.append(global_name)
         raise ValueError('Cannot compile to a single run file: The following globals are a sequence: ' +
                          ', '.join(scanning_globals))
-    sequence_id = generate_sequence_id(labscript_file)
-    make_single_run_file(output_path, sequence_globals, shots[0], sequence_id, 1, 1)
+
+    sequence_attrs, _, _ = new_sequence_details(
+        labscript_file, config=config, increment_sequence_index=True
+    )
+    make_single_run_file(output_path, sequence_globals, shots[0], sequence_attrs, 1, 1)
 
 
 def compile_labscript(labscript_file, run_file):
@@ -826,37 +957,62 @@ def dict_diff(dict1, dict2):
     return diff
 
 
-def remove_comments_and_tokenify(line):
-    """Removed EOL comments from a line, leaving it otherwise intact,
-    and returns it. Also returns the raw tokens for the line, allowing
-    comparisons between lines to be made without being sensitive to
-    whitespace."""
-    import tokenize
-    if PY2:
-        import StringIO as io
-    else:
-        import io
-    result_expression = ''
-    result_tokens = []
-    error_encountered = False
-    # This never fails because it produces a generator, syntax errors
-    # come out when looping over it:
-    tokens = tokenize.generate_tokens(io.StringIO(line).readline)
+def find_comments(src):
+    """Return a list of start and end indices for where comments are in given Python
+    source. Comments on separate lines with only whitespace in between them are
+    coalesced. Whitespace preceding a comment is counted as part of the comment."""
+    line_start = 0
+    comments = []
+    tokens = tokenize.generate_tokens(io.StringIO(src).readline)
     try:
         for token_type, token_value, (_, start), (_, end), _ in tokens:
-            if token_type == tokenize.COMMENT and not error_encountered:
-                break
-            if token_type == tokenize.ERRORTOKEN:
-                error_encountered = True
-            result_expression = result_expression.ljust(start)
-            result_expression += token_value
-            if token_value:
-                result_tokens.append(token_value)
+            if token_type == tokenize.COMMENT:
+                comments.append((line_start + start, line_start + end))
+            if token_value == '\n':
+                line_start += end
     except tokenize.TokenError:
-        # Means EOF was reached without closing brackets or something.
-        # We don't care, return what we've got.
         pass
-    return result_expression, result_tokens
+    # coalesce comments with only whitespace between them:
+    to_merge = []
+    for i, ((start1, end1), (start2, end2)) in enumerate(zip(comments, comments[1:])):
+        if not src[end1:start2].strip():
+            to_merge.append(i)
+    # Reverse order so deletion doesn't change indices:
+    for i in reversed(to_merge):
+        start1, end1 = comments[i]
+        start2, end2 = comments[i + 1]
+        comments[i] = (start1, end2)
+        del comments[i + 1]
+    # Extend each comment block to the left to include whitespace:
+    for i, (start, end) in enumerate(comments):
+        n_whitespace_chars = len(src[:start]) - len(src[:start].rstrip())
+        comments[i] = start - n_whitespace_chars, end
+    # Extend the final comment to the right to include whitespace:
+    if comments:
+        start, end = comments[-1]
+        n_whitespace_chars = len(src[end:]) - len(src[end:].rstrip())
+        comments[-1] = (start, end + n_whitespace_chars)
+    return comments
+
+
+def remove_comments_and_tokenify(src):
+    """Removes comments from source code, leaving it otherwise intact,
+    and returns it. Also returns the raw tokens for the code, allowing
+    comparisons between source to be made without being sensitive to
+    whitespace."""
+    # Remove comments
+    for (start, end) in reversed(find_comments(src)):
+        src = src[:start] + src[end:]
+    # Tokenify:
+    tokens = []
+    tokens_iter = tokenize.generate_tokens(io.StringIO(src).readline)
+    try:
+        for _, token_value, _, _, _ in tokens_iter:
+            if token_value:
+                tokens.append(token_value)
+    except tokenize.TokenError:
+        pass
+    return src, tokens
 
 
 def flatten_globals(sequence_globals, evaluated=False):

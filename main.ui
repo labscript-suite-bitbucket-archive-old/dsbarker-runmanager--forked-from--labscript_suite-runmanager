@@ -422,6 +422,19 @@ subprocess</string>
              </widget>
             </item>
             <item>
+             <widget class="QLabel" name="label_non_default_folder">
+              <property name="toolTip">
+               <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Non-default output folder chosen: all shots will be produced in this folder.&lt;/p&gt;&lt;p&gt;New folders will not automatically be created for new sequences/dates/etc.&lt;/p&gt;&lt;p&gt;To reset to the default output folder, click the 'reset to default output folder' button.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              </property>
+              <property name="text">
+               <string/>
+              </property>
+              <property name="pixmap">
+               <pixmap>:/qtutils/fugue/exclamation-white.png</pixmap>
+              </property>
+             </widget>
+            </item>
+            <item>
              <widget class="Line" name="line_2">
               <property name="orientation">
                <enum>Qt::Vertical</enum>
@@ -753,7 +766,7 @@ QToolButton:hover {
              <number>0</number>
             </property>
             <item>
-             <widget class="QTreeView" name="treeView_axes">
+             <widget class="TreeView" name="treeView_axes">
               <property name="editTriggers">
                <set>QAbstractItemView::NoEditTriggers</set>
               </property>
@@ -762,6 +775,9 @@ QToolButton:hover {
               </property>
               <property name="selectionBehavior">
                <enum>QAbstractItemView::SelectRows</enum>
+              </property>
+              <property name="alternatingRowColors">
+               <bool>true</bool>
               </property>
              </widget>
             </item>
